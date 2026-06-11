@@ -1,38 +1,74 @@
+import AppKit
 import SwiftUI
 import ForgeCore
 import ForgeMCP
 
-/// Loads the project config and runs the MCP server. GUI milestones
+/// Owns the multi-project workspace and the MCP server. GUI milestones
 /// (M3 service cards, M5 status dot) build on top of this.
 @MainActor
 final class AppState: ObservableObject {
-    @Published var projectName: String?
+    @Published var projectNames: [String] = []
     @Published var statusLine = "Starting…"
 
+    private let workspace = Workspace()
     private var mcp: ForgeMCPServer?
 
     init() {
         Task { await bootstrap() }
     }
 
-    /// Project root comes from $FORGE_PROJECT, falling back to the working
-    /// directory — both must contain .forge/config.json.
+    /// Registered projects come from ~/.forge/projects.json; $FORGE_PROJECT
+    /// (if set) is added for this session without being persisted.
     private func bootstrap() async {
-        let env = ProcessInfo.processInfo.environment["FORGE_PROJECT"]
-        let root = URL(fileURLWithPath: env ?? FileManager.default.currentDirectoryPath)
+        for root in ProjectRegistry.load() {
+            _ = try? await workspace.addProject(root: root)
+        }
+        if let env = ProcessInfo.processInfo.environment["FORGE_PROJECT"] {
+            _ = try? await workspace.addProject(root: URL(fileURLWithPath: env))
+        }
+        await refresh()
 
+        let server = ForgeMCPServer(tools: ForgeTools(workspace: workspace))
         do {
-            let config = try ForgeConfig.load(projectRoot: root)
-            let manager = ServiceManager(config: config, projectRoot: root)
-            let server = ForgeMCPServer(tools: ForgeTools(manager: manager))
             try await server.start()
             mcp = server
-            projectName = config.name
             statusLine = "MCP: http://127.0.0.1:\(ForgeMCPServer.defaultPort)\(ForgeMCPServer.endpoint)"
-        } catch ConfigError.notFound {
-            statusLine = "No .forge/config.json found — set FORGE_PROJECT"
         } catch {
             statusLine = "MCP failed to start: \(error.localizedDescription)"
+        }
+    }
+
+    private func refresh() async {
+        let projects = await workspace.projects
+        projectNames = projects.map(\.config.name)
+    }
+
+    func addProject() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a project root containing .forge/config.json"
+        guard panel.runModal() == .OK, let root = panel.url else { return }
+
+        Task {
+            do {
+                try await workspace.addProject(root: root)
+                try ProjectRegistry.save(await workspace.roots)
+                await refresh()
+            } catch ConfigError.notFound {
+                statusLine = "No .forge/config.json in \(root.lastPathComponent)"
+            } catch {
+                statusLine = "Could not add project: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func removeProject(_ name: String) {
+        Task {
+            await workspace.removeProject(named: name)
+            try? ProjectRegistry.save(await workspace.roots)
+            await refresh()
         }
     }
 }
@@ -43,9 +79,17 @@ struct ForgeApp: App {
 
     var body: some Scene {
         MenuBarExtra("Forge", systemImage: "hammer.circle.fill") {
-            if let project = state.projectName {
-                Text("Project: \(project)")
+            if state.projectNames.isEmpty {
+                Text("No projects registered")
+            } else {
+                ForEach(state.projectNames, id: \.self) { name in
+                    Menu(name) {
+                        Button("Remove") { state.removeProject(name) }
+                    }
+                }
             }
+            Divider()
+            Button("Add Project…") { state.addProject() }
             Text(state.statusLine)
             Divider()
             Button("Quit Forge") {

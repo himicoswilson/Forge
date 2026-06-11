@@ -49,9 +49,11 @@ public final class MockCommandRunner: CommandRunning, @unchecked Sendable {
 extension MockCommandRunner {
     /// Simulates a machine where the given ports are listening (port → pid)
     /// and the given tmux sessions exist. `ps` reports a fixed rss/etime.
+    /// `javaHome` is what `/usr/libexec/java_home` answers (nil = no JDK found).
     public static func simulating(
         listeningPorts: [Int: Int32] = [:],
-        sessions: Set<String> = []
+        sessions: Set<String> = [],
+        javaHome: String? = nil
     ) -> MockCommandRunner {
         MockCommandRunner { call in
             switch call.executable {
@@ -63,6 +65,9 @@ extension MockCommandRunner {
                 return CommandResult(exitCode: 0, stdout: "129024 01:23:45\n")
             case "tmux" where call.arguments.first == "has-session":
                 return CommandResult(exitCode: sessions.contains(call.arguments[2]) ? 0 : 1)
+            case "/usr/libexec/java_home":
+                guard let javaHome else { return CommandResult(exitCode: 1, stderr: "Unable to find any JVMs") }
+                return CommandResult(exitCode: 0, stdout: javaHome + "\n")
             default:
                 return CommandResult(exitCode: 0)
             }

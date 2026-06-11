@@ -8,24 +8,45 @@ import Testing
 @Suite("ForgeMCP")
 struct ForgeMCPTests {
 
-    let config = ForgeConfig(
-        name: "normal-cloud",
-        prefix: "wr",
-        scripts: ".claude/skills/cloud-run/scripts",
-        services: [
-            ServiceConfig(name: "gateway", port: 8080),
-            ServiceConfig(name: "auth", port: 9201),
-            ServiceConfig(name: "tenant", port: 9400),
-            ServiceConfig(name: "train", port: 9700),
-        ]
-    )
-    let root = URL(fileURLWithPath: "/proj")
+    /// Primary project: wr-prefixed services, like the original single-project setup.
+    private func cloudA(_ runner: MockCommandRunner) -> ServiceManager {
+        ServiceManager(
+            config: ForgeConfig(
+                name: "cloud-a", prefix: "wr",
+                services: [
+                    ServiceConfig(name: "gateway", port: 8080),
+                    ServiceConfig(name: "auth", port: 9201),
+                    ServiceConfig(name: "tenant", port: 9400),
+                    ServiceConfig(name: "train", port: 9700),
+                ]
+            ),
+            projectRoot: URL(fileURLWithPath: "/projects/cloud-a"),
+            runner: runner
+        )
+    }
 
-    /// Full in-process MCP stack: real Server + Client talking over
-    /// InMemoryTransport, shell scripted by MockCommandRunner.
+    /// Second project sharing the "gateway" service name with cloud-a.
+    private func cloudB(_ runner: MockCommandRunner) -> ServiceManager {
+        ServiceManager(
+            config: ForgeConfig(
+                name: "cloud-b", prefix: "nb", jdk: "21",
+                services: [
+                    ServiceConfig(name: "gateway", port: 18080),
+                    ServiceConfig(name: "billing", port: 19000),
+                ]
+            ),
+            projectRoot: URL(fileURLWithPath: "/projects/cloud-b"),
+            runner: runner
+        )
+    }
+
+    /// Full in-process MCP stack: real Server + Client over InMemoryTransport,
+    /// two registered projects, shell scripted by MockCommandRunner.
     private func connect(_ runner: MockCommandRunner) async throws -> Client {
-        let manager = ServiceManager(config: config, projectRoot: root, runner: runner)
-        let server = await ForgeMCPServer.makeServer(tools: ForgeTools(manager: manager))
+        let workspace = Workspace(runner: runner)
+        await workspace.register(cloudA(runner))
+        await workspace.register(cloudB(runner))
+        let server = await ForgeMCPServer.makeServer(tools: ForgeTools(workspace: workspace))
         let (clientTransport, serverTransport) = await InMemoryTransport.createConnectedPair()
         try await server.start(transport: serverTransport)
         let client = Client(name: "forge-tests", version: "1.0.0")
@@ -52,38 +73,64 @@ struct ForgeMCPTests {
         #expect(tools.allSatisfy { $0.description?.isEmpty == false })
     }
 
-    @Test("list_services returns a JSON snapshot of every service")
+    @Test("list_services snapshots every project and service")
     func listServices() async throws {
-        let client = try await connect(.simulating(listeningPorts: [8080: 11, 9201: 22], sessions: ["wr-train"]))
+        let client = try await connect(.simulating(listeningPorts: [8080: 11, 19000: 22], sessions: ["wr-train"]))
         let (content, isError) = try await client.callTool(name: "list_services")
         #expect(isError != true)
 
-        let payload = try JSONDecoder().decode(ServiceListPayload.self, from: Data(text(content).utf8))
-        #expect(payload.services.map(\.name) == ["gateway", "auth", "tenant", "train"])
-        #expect(payload.services.map(\.state) == ["up", "up", "down", "starting"])
-        #expect(payload.services[0].pid == 11)
-        #expect(payload.services[0].memoryKB == 129024)
+        let payload = try JSONDecoder().decode(WorkspacePayload.self, from: Data(text(content).utf8))
+        #expect(payload.projects.map(\.name) == ["cloud-a", "cloud-b"])
+        #expect(payload.projects[0].services.map(\.state) == ["up", "down", "down", "starting"])
+        #expect(payload.projects[1].jdk == "21")
+        #expect(payload.projects[1].services.map(\.state) == ["down", "up"])
     }
 
-    @Test("get_service reports one service's status")
+    @Test("list_services can be filtered to one project")
+    func listServicesFiltered() async throws {
+        let client = try await connect(.simulating())
+        let (content, isError) = try await client.callTool(name: "list_services", arguments: ["project": "cloud-b"])
+        #expect(isError != true)
+
+        let payload = try JSONDecoder().decode(WorkspacePayload.self, from: Data(text(content).utf8))
+        #expect(payload.projects.map(\.name) == ["cloud-b"])
+    }
+
+    @Test("get_service resolves a unique name across projects")
     func getService() async throws {
-        let client = try await connect(.simulating(listeningPorts: [9201: 22]))
-        let (content, isError) = try await client.callTool(name: "get_service", arguments: ["service": "auth"])
+        let client = try await connect(.simulating(listeningPorts: [19000: 22]))
+        let (content, isError) = try await client.callTool(name: "get_service", arguments: ["service": "billing"])
         #expect(isError != true)
 
         let payload = try JSONDecoder().decode(StatusPayload.self, from: Data(text(content).utf8))
-        #expect(payload.name == "auth")
+        #expect(payload.project == "cloud-b")
         #expect(payload.state == "up")
         #expect(payload.uptime == "01:23:45")
     }
 
-    @Test("unknown service name → isError with the known names listed")
+    @Test("duplicated service name requires the project argument")
+    func ambiguousService() async throws {
+        let client = try await connect(.simulating())
+        let (content, isError) = try await client.callTool(name: "get_service", arguments: ["service": "gateway"])
+        #expect(isError == true)
+        #expect(text(content).contains("multiple projects"))
+        #expect(text(content).contains("cloud-a, cloud-b"))
+
+        let (resolved, ok) = try await client.callTool(
+            name: "get_service", arguments: ["service": "gateway", "project": "cloud-b"])
+        #expect(ok != true)
+        let payload = try JSONDecoder().decode(StatusPayload.self, from: Data(text(resolved).utf8))
+        #expect(payload.port == 18080)
+    }
+
+    @Test("unknown service name → isError listing project/service candidates")
     func unknownService() async throws {
         let client = try await connect(.simulating())
         let (content, isError) = try await client.callTool(name: "get_service", arguments: ["service": "nope"])
         #expect(isError == true)
         #expect(text(content).contains("Unknown service 'nope'"))
-        #expect(text(content).contains("gateway, auth, tenant, train"))
+        #expect(text(content).contains("cloud-a/gateway"))
+        #expect(text(content).contains("cloud-b/billing"))
     }
 
     @Test("missing required argument → isError, not a crash")
@@ -108,16 +155,29 @@ struct ForgeMCPTests {
         #expect(runner.commandLines.contains("tmux capture-pane -p -t wr-auth -S -50"))
     }
 
-    @Test("start_service launches the start script in tmux")
+    @Test("start_service launches the built-in mvn command in tmux")
     func startService() async throws {
         let runner = MockCommandRunner.simulating()
         let client = try await connect(runner)
         let (content, isError) = try await client.callTool(name: "start_service", arguments: ["service": "train"])
         #expect(isError != true)
-        #expect(text(content).contains("Started train"))
+        #expect(text(content).contains("Started cloud-a/train"))
         #expect(runner.calls.contains { $0.executable == "tmux" && $0.arguments == [
-            "new-session", "-d", "-s", "wr-train", "-c", "/proj",
-            "bash \"/proj/.claude/skills/cloud-run/scripts/start-train.sh\"",
+            "new-session", "-d", "-s", "wr-train", "-c", "/projects/cloud-a",
+            "mvn spring-boot:run -pl wr-train -am",
+        ] })
+    }
+
+    @Test("start_service uses the project's JDK when configured")
+    func startServiceWithJDK() async throws {
+        let runner = MockCommandRunner.simulating(javaHome: "/jdk21")
+        let client = try await connect(runner)
+        let (_, isError) = try await client.callTool(name: "start_service", arguments: ["service": "billing"])
+        #expect(isError != true)
+        #expect(runner.commandLines.contains("/usr/libexec/java_home -v 21"))
+        #expect(runner.calls.contains { $0.executable == "tmux" && $0.arguments == [
+            "new-session", "-d", "-s", "nb-billing", "-c", "/projects/cloud-b",
+            "JAVA_HOME=\"/jdk21\" mvn spring-boot:run -pl nb-billing -am",
         ] })
     }
 
@@ -137,7 +197,7 @@ struct ForgeMCPTests {
         let client = try await connect(runner)
         let (content, isError) = try await client.callTool(name: "stop_service", arguments: ["service": "auth"])
         #expect(isError != true)
-        #expect(text(content).contains("Stopped auth"))
+        #expect(text(content).contains("Stopped cloud-a/auth"))
         #expect(runner.commandLines.contains("tmux kill-session -t wr-auth"))
     }
 
@@ -175,6 +235,20 @@ struct ForgeMCPTests {
             .filter { $0.executable == "tmux" && $0.arguments.first == "new-session" }
             .map { $0.arguments[3] }
         #expect(launched == ["wr-tenant", "wr-train"])
+    }
+
+    @Test("empty workspace explains how to register a project")
+    func emptyWorkspace() async throws {
+        let workspace = Workspace(runner: MockCommandRunner.simulating())
+        let server = await ForgeMCPServer.makeServer(tools: ForgeTools(workspace: workspace))
+        let (clientTransport, serverTransport) = await InMemoryTransport.createConnectedPair()
+        try await server.start(transport: serverTransport)
+        let client = Client(name: "forge-tests", version: "1.0.0")
+        try await client.connect(transport: clientTransport)
+
+        let (content, isError) = try await client.callTool(name: "get_service", arguments: ["service": "auth"])
+        #expect(isError == true)
+        #expect(text(content).contains("No projects registered"))
     }
 
     @Test("unknown tool name is a protocol error, not a tool result")

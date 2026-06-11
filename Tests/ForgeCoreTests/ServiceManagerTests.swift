@@ -9,7 +9,6 @@ struct ServiceManagerTests {
     let config = ForgeConfig(
         name: "normal-cloud",
         prefix: "wr",
-        scripts: ".claude/skills/cloud-run/scripts",
         services: [
             ServiceConfig(name: "gateway", port: 8080),
             ServiceConfig(name: "auth", port: 9201),
@@ -66,14 +65,38 @@ struct ServiceManagerTests {
 
     // MARK: - Lifecycle
 
-    @Test("start launches start-<name>.sh in a detached session at project root")
+    @Test("start launches mvn spring-boot:run in a detached session at project root")
     func start() throws {
         let runner = world()
         try manager(runner).start(config.service(named: "train")!)
         #expect(runner.calls.last?.arguments == [
             "new-session", "-d", "-s", "wr-train", "-c", "/proj",
-            "bash \"/proj/.claude/skills/cloud-run/scripts/start-train.sh\"",
+            "mvn spring-boot:run -pl wr-train -am",
         ])
+    }
+
+    @Test("start with a configured JDK resolves JAVA_HOME and prefixes the command")
+    func startWithJDK() throws {
+        let jdkConfig = ForgeConfig(name: "normal-cloud", prefix: "wr", jdk: "17", services: config.services)
+        let runner = MockCommandRunner.simulating(javaHome: "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home")
+        let mgr = ServiceManager(config: jdkConfig, projectRoot: root, runner: runner)
+
+        try mgr.start(jdkConfig.service(named: "train")!)
+
+        #expect(runner.commandLines.first == "/usr/libexec/java_home -v 17")
+        #expect(runner.calls.last?.arguments.last ==
+            "JAVA_HOME=\"/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home\" mvn spring-boot:run -pl wr-train -am")
+    }
+
+    @Test("start falls back to PATH's java when the JDK version is not installed")
+    func startWithMissingJDK() throws {
+        let jdkConfig = ForgeConfig(name: "normal-cloud", prefix: "wr", jdk: "99", services: config.services)
+        let runner = MockCommandRunner.simulating(javaHome: nil)
+        let mgr = ServiceManager(config: jdkConfig, projectRoot: root, runner: runner)
+
+        try mgr.start(jdkConfig.service(named: "train")!)
+
+        #expect(runner.calls.last?.arguments.last == "mvn spring-boot:run -pl wr-train -am")
     }
 
     @Test("stop kills an existing session")
@@ -108,6 +131,19 @@ struct ServiceManagerTests {
         #expect(call.executable == "mvn")
         #expect(call.arguments == ["compile", "-pl", "wr-train", "-am", "-DskipTests", "-q"])
         #expect(call.workingDirectory == root)
+    }
+
+    @Test("hotRestart compiles with the project's JDK when configured")
+    func hotRestartWithJDK() throws {
+        let jdkConfig = ForgeConfig(name: "normal-cloud", prefix: "wr", jdk: "17", services: config.services)
+        let runner = MockCommandRunner.simulating(javaHome: "/jdk17")
+        let mgr = ServiceManager(config: jdkConfig, projectRoot: root, runner: runner)
+
+        try mgr.hotRestart(jdkConfig.service(named: "train")!)
+
+        let call = runner.calls.last!
+        #expect(call.executable == "env")
+        #expect(call.arguments == ["JAVA_HOME=/jdk17", "mvn", "compile", "-pl", "wr-train", "-am", "-DskipTests", "-q"])
     }
 
     @Test("hotRestart surfaces mvn failure")
