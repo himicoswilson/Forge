@@ -1,4 +1,5 @@
 import Foundation
+import ForgeTestSupport
 import Testing
 @testable import ForgeCore
 

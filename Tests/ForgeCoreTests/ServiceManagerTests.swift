@@ -1,4 +1,5 @@
 import Foundation
+import ForgeTestSupport
 import Testing
 @testable import ForgeCore
 
@@ -21,20 +22,7 @@ struct ServiceManagerTests {
     /// Simulates a machine where the given ports are listening and the
     /// given tmux sessions exist.
     private func world(listeningPorts: [Int: Int32] = [:], sessions: Set<String> = []) -> MockCommandRunner {
-        MockCommandRunner { call in
-            switch call.executable {
-            case "lsof":
-                let port = Int(call.arguments[0].replacingOccurrences(of: "-ti:", with: ""))!
-                guard let pid = listeningPorts[port] else { return CommandResult(exitCode: 1) }
-                return CommandResult(exitCode: 0, stdout: "\(pid)\n")
-            case "ps":
-                return CommandResult(exitCode: 0, stdout: "129024 01:23:45\n")
-            case "tmux" where call.arguments.first == "has-session":
-                return CommandResult(exitCode: sessions.contains(call.arguments[2]) ? 0 : 1)
-            default:
-                return CommandResult(exitCode: 0)
-            }
-        }
+        .simulating(listeningPorts: listeningPorts, sessions: sessions)
     }
 
     private func manager(_ runner: MockCommandRunner) -> ServiceManager {
