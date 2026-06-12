@@ -26,6 +26,27 @@ public struct TmuxController: Sendable {
         }
     }
 
+    /// Whether the session's pane process has exited. With `remain-on-exit`
+    /// tmux keeps the dead pane around, so the session still "exists" while
+    /// nothing is running in it. `false` when the session doesn't exist.
+    public func isPaneDead(_ name: String) -> Bool {
+        guard let result = try? runner.run("tmux", ["list-panes", "-t", name, "-F", "#{pane_dead}"]),
+              result.succeeded else {
+            return false
+        }
+        return result.stdout.split(whereSeparator: \.isNewline).first == "1"
+    }
+
+    /// When the session was created (`#{session_created}`, a unix epoch).
+    public func sessionCreated(_ name: String) -> Date? {
+        guard let result = try? runner.run("tmux", ["display-message", "-p", "-t", name, "#{session_created}"]),
+              result.succeeded,
+              let epoch = TimeInterval(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return nil
+        }
+        return Date(timeIntervalSince1970: epoch)
+    }
+
     public func killSession(_ name: String) throws {
         let result = try runner.run("tmux", ["kill-session", "-t", name])
         guard result.succeeded else {

@@ -21,25 +21,35 @@ The package also opens directly in Xcode: `open Package.swift`.
 
 ## Configure a project
 
-Drop a `.forge/config.json` into the project root — only `services` is required:
+No configuration is required: services are **auto-discovered** from the Maven
+module tree — every leaf module reachable from the root `pom.xml`'s `<modules>`
+that declares a local `server.port` becomes a service.
+
+A `.forge/config.json` in the project root overrides any derived default
+(every field optional; `services` entries match a discovered service by name
+*or port*, or add one discovery can't see, e.g. a port that lives in Nacos):
 
 ```json
 {
+  "name": "normal-cloud",
+  "prefix": "wr",
+  "jdk": "17",
   "services": [
-    { "name": "gateway", "port": 8080 },
-    { "name": "auth",    "port": 9201 }
+    { "name": "system", "port": 9600, "module": "wr-system-svc" }
   ]
 }
 ```
 
-Forge owns the start command (`mvn spring-boot:run -pl <module> -am` in a tmux
-session) — no start scripts needed. Optional keys:
-
 - `name` — project display name (default: folder name)
-- `prefix` — tmux session / Maven module prefix (default: `name`); modules
-  resolve to `<prefix>-<service>`, overridable per service via `module`
+- `prefix` — tmux session / Maven module prefix (default: shared artifactId
+  prefix, falling back to `name`); modules resolve to `<prefix>-<service>`,
+  overridable per service via `module`
 - `jdk` — JDK version, e.g. `"17"` (default: read from `.java-version` in the
   project root; resolved to a `JAVA_HOME` via `/usr/libexec/java_home`)
+
+Forge owns the start command — no start scripts needed. Each service runs in
+its own tmux session as
+`mvn install -pl <module> -am -DskipTests && mvn org.springframework.boot:spring-boot-maven-plugin:run -pl <module>`.
 
 ## Run it
 
@@ -73,4 +83,8 @@ or in your project's `.mcp.json`:
 ```
 
 Tools: `list_services`, `get_service`, `get_logs`, `start_service`,
-`stop_service`, `restart_service`, `hotrestart_service`, `warmup`.
+`stop_service`, `restart_service`, `hotrestart_service`.
+
+Lifecycle tools take one or more services, are idempotent (starting an
+already-running service is a skip, not an error), and by default block until
+the service reports UP — failures include the recent log tail.

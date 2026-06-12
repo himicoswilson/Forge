@@ -48,6 +48,31 @@ struct TmuxControllerTests {
         }
     }
 
+    @Test("isPaneDead reads #{pane_dead} from list-panes")
+    func isPaneDead() {
+        let runner = MockCommandRunner { _ in CommandResult(exitCode: 0, stdout: "1\n") }
+        #expect(TmuxController(runner: runner).isPaneDead("wr-auth"))
+        #expect(runner.commandLines == ["tmux list-panes -t wr-auth -F #{pane_dead}"])
+    }
+
+    @Test("isPaneDead is false for a live pane or a missing session")
+    func isPaneDeadFalse() {
+        let live = MockCommandRunner { _ in CommandResult(exitCode: 0, stdout: "0\n") }
+        #expect(!TmuxController(runner: live).isPaneDead("wr-auth"))
+        let missing = MockCommandRunner { _ in CommandResult(exitCode: 1, stderr: "can't find session") }
+        #expect(!TmuxController(runner: missing).isPaneDead("wr-auth"))
+    }
+
+    @Test("sessionCreated parses the #{session_created} epoch")
+    func sessionCreated() {
+        let runner = MockCommandRunner { _ in CommandResult(exitCode: 0, stdout: "1750000000\n") }
+        let tmux = TmuxController(runner: runner)
+        #expect(tmux.sessionCreated("wr-auth") == Date(timeIntervalSince1970: 1_750_000_000))
+        #expect(runner.commandLines == ["tmux display-message -p -t wr-auth #{session_created}"])
+        let missing = MockCommandRunner { _ in CommandResult(exitCode: 1) }
+        #expect(TmuxController(runner: missing).sessionCreated("wr-auth") == nil)
+    }
+
     @Test("killSession targets the right session")
     func killSession() throws {
         let runner = MockCommandRunner()

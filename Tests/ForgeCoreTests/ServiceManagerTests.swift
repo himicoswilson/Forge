@@ -45,10 +45,13 @@ struct ServiceManagerTests {
         #expect(status.uptime == "01:23:45")
     }
 
-    @Test("session alive but port silent → starting")
+    @Test("session alive but port silent → starting, with elapsed startingFor")
     func statusStarting() {
         let mgr = manager(world(sessions: ["wr-train"]))
-        #expect(mgr.status(of: config.service(named: "train")!).state == .starting)
+        let status = mgr.status(of: config.service(named: "train")!)
+        #expect(status.state == .starting)
+        // Simulated sessions are 42 seconds old.
+        #expect(status.startingFor?.hasPrefix("00:4") == true)
     }
 
     @Test("port bound but actuator not UP yet → starting, with pid info")
@@ -58,8 +61,16 @@ struct ServiceManagerTests {
         #expect(status.state == .starting)
         #expect(status.pid == 4242)
         #expect(status.memoryKB == 129024)
+        // No tmux session to date the start from → falls back to process uptime.
+        #expect(status.startingFor == "01:23:45")
         #expect(runner.commandLines.contains(
             "/usr/bin/curl -s -m 1 -w \n%{http_code} http://127.0.0.1:9201/actuator/health"))
+    }
+
+    @Test("session whose pane died (remain-on-exit) → down, not starting")
+    func statusDeadPane() {
+        let mgr = manager(.simulating(deadSessions: ["wr-train"]))
+        #expect(mgr.status(of: config.service(named: "train")!).state == .down)
     }
 
     @Test("no port, no session → down")
@@ -114,7 +125,7 @@ struct ServiceManagerTests {
 
         try mgr.start(jdkConfig.service(named: "train")!)
 
-        #expect(runner.commandLines.first == "/usr/libexec/java_home -v 17")
+        #expect(runner.commandLines.contains("/usr/libexec/java_home -v 17"))
         let home = "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home"
         #expect(newSession(in: runner)?.arguments.last ==
             "env JAVA_HOME=\"\(home)\" mvn install -pl wr-train -am -DskipTests"
@@ -162,7 +173,46 @@ struct ServiceManagerTests {
         let runner = world(sessions: ["wr-gateway"])
         try manager(runner).restart(config.service(named: "gateway")!)
         let tmuxOps = runner.calls.filter { $0.executable == "tmux" }.map { $0.arguments[0] }
-        #expect(tmuxOps == ["has-session", "kill-session", "new-session", "pipe-pane"])
+        #expect(tmuxOps == ["has-session", "kill-session", "has-session", "new-session", "pipe-pane"])
+    }
+
+    @Test("start clears a stale dead session before launching")
+    func startClearsDeadSession() throws {
+        let runner = MockCommandRunner.simulating(deadSessions: ["wr-train"])
+        try manager(runner).start(config.service(named: "train")!)
+        let tmuxOps = runner.calls.filter { $0.executable == "tmux" }.map { $0.arguments[0] }
+        #expect(tmuxOps == ["has-session", "list-panes", "kill-session", "new-session", "pipe-pane"])
+    }
+
+    // MARK: - startIfNeeded
+
+    @Test("startIfNeeded skips an up service")
+    func startIfNeededUp() throws {
+        let runner = world(listeningPorts: [9201: 4242])
+        #expect(try manager(runner).startIfNeeded(config.service(named: "auth")!) == .alreadyUp)
+        #expect(newSession(in: runner) == nil)
+    }
+
+    @Test("startIfNeeded skips a starting service")
+    func startIfNeededStarting() throws {
+        let runner = world(sessions: ["wr-auth"])
+        #expect(try manager(runner).startIfNeeded(config.service(named: "auth")!) == .alreadyStarting)
+        #expect(newSession(in: runner) == nil)
+    }
+
+    @Test("startIfNeeded launches a down service")
+    func startIfNeededDown() throws {
+        let runner = world()
+        #expect(try manager(runner).startIfNeeded(config.service(named: "train")!) == .started)
+        #expect(newSession(in: runner) != nil)
+    }
+
+    @Test("startIfNeeded treats a dead session as down and relaunches")
+    func startIfNeededDeadSession() throws {
+        let runner = MockCommandRunner.simulating(deadSessions: ["wr-train"])
+        #expect(try manager(runner).startIfNeeded(config.service(named: "train")!) == .started)
+        #expect(runner.commandLines.contains("tmux kill-session -t wr-train"))
+        #expect(newSession(in: runner) != nil)
     }
 
     // MARK: - Hot restart
@@ -197,6 +247,21 @@ struct ServiceManagerTests {
         }
         #expect(throws: CommandError.self) {
             try manager(runner).hotRestart(config.service(named: "train")!)
+        }
+    }
+
+    @Test("hotRestart failure with empty stderr surfaces the stdout tail (mvn -q errors land there)")
+    func hotRestartFailureViaStdout() {
+        let runner = MockCommandRunner { call in
+            call.executable == "mvn"
+                ? CommandResult(exitCode: 1, stdout: "[ERROR] TrainService.java:[10,5] cannot find symbol\n")
+                : CommandResult(exitCode: 0)
+        }
+        #expect {
+            try manager(runner).hotRestart(config.service(named: "train")!)
+        } throws: { error in
+            guard case CommandError.failed(_, _, let detail) = error else { return false }
+            return detail.contains("cannot find symbol")
         }
     }
 

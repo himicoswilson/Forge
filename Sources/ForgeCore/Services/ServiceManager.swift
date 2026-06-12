@@ -45,20 +45,41 @@ public struct ServiceManager: Sendable {
     /// services answer on their port well before they finish initializing,
     /// so port-bound + health not UP reports `.starting` (with pid info).
     public func status(of service: ServiceConfig) -> ServiceStatus {
+        let session = config.sessionName(for: service)
         let pids = ports.pids(onPort: service.port)
         if let pid = pids.first {
             let info = ports.processInfo(pid: pid)
-            let state: ServiceState
             switch health.check(port: service.port) {
-            case .ready, .noActuator: state = .up
-            case .notReady: state = .starting
+            case .ready, .noActuator:
+                return ServiceStatus(service: service, state: .up, pid: pid, memoryKB: info?.memoryKB, uptime: info?.uptime)
+            case .notReady:
+                return ServiceStatus(
+                    service: service, state: .starting, pid: pid,
+                    memoryKB: info?.memoryKB, uptime: info?.uptime,
+                    startingFor: startingDuration(session: session) ?? info?.uptime
+                )
             }
-            return ServiceStatus(service: service, state: state, pid: pid, memoryKB: info?.memoryKB, uptime: info?.uptime)
         }
-        if tmux.hasSession(config.sessionName(for: service)) {
-            return ServiceStatus(service: service, state: .starting)
+        if tmux.hasSession(session) {
+            // remain-on-exit can keep the session alive after its process
+            // died — that's down (start failed/exited), not starting.
+            if tmux.isPaneDead(session) {
+                return ServiceStatus(service: service, state: .down)
+            }
+            return ServiceStatus(service: service, state: .starting, startingFor: startingDuration(session: session))
         }
         return ServiceStatus(service: service, state: .down)
+    }
+
+    /// Elapsed time since the session was created, formatted like `ps` etime
+    /// ("00:42" / "01:23:45"). nil when the session doesn't exist.
+    private func startingDuration(session: String) -> String? {
+        guard let created = tmux.sessionCreated(session) else { return nil }
+        let total = max(0, Int(Date().timeIntervalSince(created)))
+        let (h, m, s) = (total / 3600, total / 60 % 60, total % 60)
+        return h > 0
+            ? String(format: "%02d:%02d:%02d", h, m, s)
+            : String(format: "%02d:%02d", m, s)
     }
 
     /// Returns status for every service not in `excluding`, checked in parallel.
@@ -104,6 +125,11 @@ public struct ServiceManager: Sendable {
     /// which tmux may use as the session shell.
     public func start(_ service: ServiceConfig) throws {
         let session = config.sessionName(for: service)
+        // A dead pane left behind by remain-on-exit would make new-session
+        // fail with "duplicate session" — clear it before launching.
+        if tmux.hasSession(session), tmux.isPaneDead(session) {
+            try? tmux.killSession(session)
+        }
         try? FileManager.default.removeItem(
             at: logsDirectory.appendingPathComponent("\(session).log")
         )
@@ -142,6 +168,26 @@ public struct ServiceManager: Sendable {
         try start(service)
     }
 
+    /// What an idempotent start did (or skipped) for one service.
+    public enum StartOutcome: Sendable, Equatable {
+        case started
+        case alreadyUp
+        case alreadyStarting
+    }
+
+    /// Idempotent start: launches only when the service is down. Up and
+    /// starting services are left alone; a stale dead session is cleared
+    /// by `start` itself.
+    public func startIfNeeded(_ service: ServiceConfig) throws -> StartOutcome {
+        switch status(of: service).state {
+        case .up: return .alreadyUp
+        case .starting: return .alreadyStarting
+        case .down:
+            try start(service)
+            return .started
+        }
+    }
+
     /// Recompiles the service's Maven module so Spring DevTools reloads it:
     /// `mvn compile -pl <module> -am -DskipTests -q` (with the project's JDK).
     public func hotRestart(_ service: ServiceConfig) throws {
@@ -154,7 +200,16 @@ public struct ServiceManager: Sendable {
             result = try runner.run("mvn", mvnArgs, workingDirectory: projectRoot)
         }
         guard result.succeeded else {
-            throw CommandError.failed(command: "mvn compile -pl \(module)", exitCode: result.exitCode, stderr: result.stderr)
+            // mvn -q prints compile errors to stdout; fall back to its tail
+            // when stderr is empty so the failure is actionable.
+            let detail = result.stderr.isEmpty
+                ? result.stdout
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .suffix(40)
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                : result.stderr
+            throw CommandError.failed(command: "mvn compile -pl \(module)", exitCode: result.exitCode, stderr: detail)
         }
     }
 

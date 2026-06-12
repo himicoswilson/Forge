@@ -23,23 +23,25 @@ Forge.app
 │     ├── health check   — curl /actuator/health (port bound ≠ ready)
 │     ├── tmux control   — new-session / kill-session / pipe-pane / capture-pane
 │     └── mvn compile    — hotrestart trigger
-└── MCP Server           — HTTP/SSE on localhost:27182
-      └── exposes tools to Claude Code via settings.json
+└── MCP Server           — Streamable HTTP on http://127.0.0.1:27182/mcp
+      └── exposes tools to AI agents (Claude Code, etc.)
 ```
 
 ---
 
 ## MCP Tools
 
+Lifecycle tools take one or more services, are **idempotent**, and **block until UP by default** (`wait: true`, `timeoutSeconds: 180`); on timeout the error carries the last 40 log lines. `project` is only required when a service name exists in several registered projects.
+
 | Tool | Arguments | Description |
 |---|---|---|
-| `list_services` | — | Returns status snapshot of all known services |
-| `get_service` | `service: string` | Status of one service: up/down/starting, pid, port, memory |
-| `get_logs` | `service, lines?` | Last N lines from the service's tmux pane |
-| `start_service` | `service` | `mvn install -pl <module> -am && …spring-boot-maven-plugin:run -pl <module>` in a new tmux session |
-| `stop_service` | `service` | Kill the tmux session |
-| `restart_service` | `service` | Kill session → relaunch (full restart) |
-| `hotrestart_service` | `service` | `mvn compile -pl <module> -am -DskipTests -q` |
+| `list_services` | `project?` | Status snapshot of every service in all registered projects: up/starting/down, pid, port, memory, uptime, `startingFor` |
+| `get_service` | `service, project?` | Status of one service |
+| `get_logs` | `service, project?, lines?` | Last N lines from the service's tmux pane |
+| `start_service` | `services[], project?, wait?, timeoutSeconds?` | `mvn install -pl <module> -am -DskipTests && …spring-boot-maven-plugin:run -pl <module>` in a new tmux session. Skips services already up/starting (never an error), clears stale dead sessions first |
+| `stop_service` | `services[], project?` | Kill the tmux session, then SIGTERM whatever still holds the port |
+| `restart_service` | `services[], project?, wait?, timeoutSeconds?` | Kill session → relaunch (full restart), then wait until UP |
+| `hotrestart_service` | `services[], project?, wait?, timeoutSeconds?` | `mvn compile -pl <module> -am -DskipTests -q` so Spring DevTools reloads, then confirm the service is back UP |
 
 ---
 
@@ -65,8 +67,8 @@ Forge.app
 |---|---|---|
 | GUI | SwiftUI (macOS 13+) | Native, no Electron overhead |
 | Shell bridge | `Foundation.Process` | Run tmux / mvn commands directly |
-| MCP transport | HTTP SSE on `localhost:27182` | Claude Code connects via URL |
-| MCP protocol | Hand-rolled in Swift (JSON) | No official Swift SDK; protocol is simple |
+| MCP transport | Streamable HTTP (stateless) on `127.0.0.1:27182/mcp` | Current MCP spec; clients connect via URL with `"type": "http"` |
+| MCP protocol | Official `modelcontextprotocol/swift-sdk` | Supersedes the original hand-rolled HTTP/SSE plan |
 | Log streaming | Timer + `tmux capture-pane` poll | No dependency on pty |
 
 ---
@@ -94,15 +96,18 @@ Multiple projects can be registered; Forge switches between them from the menu b
 
 ## Claude Code integration
 
-Add to `.claude/settings.json`:
+Register the running app as an HTTP MCP server:
+
+```sh
+claude mcp add --transport http forge http://127.0.0.1:27182/mcp
+```
+
+or in the project's `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "forge": {
-      "type": "sse",
-      "url": "http://localhost:27182/sse"
-    }
+    "forge": { "type": "http", "url": "http://127.0.0.1:27182/mcp" }
   }
 }
 ```
@@ -113,11 +118,13 @@ AI then calls `forge:get_service`, `forge:hotrestart_service`, etc. directly —
 
 ## Milestones
 
-| # | Deliverable |
-|---|---|
-| M1 | ServiceManager Swift layer — all shell ops working, unit-tested |
-| M2 | MCP server — all 7 tools, SSE transport, Claude Code verified |
-| M3 | SwiftUI window — service cards + start/stop/hotrestart buttons |
-| M4 | Log drawer — live tail per service |
-| M5 | Menu bar icon — colour state, quick-access popover |
-| M6 | Multi-project support via `.forge/config.json` |
+All milestones are delivered (see CLAUDE.md for the running checklist).
+
+| # | Deliverable | Status |
+|---|---|---|
+| M1 | ServiceManager Swift layer — all shell ops working, unit-tested | ✅ |
+| M2 | MCP server — all 7 tools, Streamable HTTP transport, Claude Code verified | ✅ |
+| M3 | SwiftUI window — service cards + start/stop/hotrestart buttons | ✅ |
+| M4 | Log drawer — live tail per service | ✅ |
+| M5 | Menu bar icon — colour state, quick-access popover | ✅ |
+| M6 | Multi-project support — workspace + registry (`~/.forge/projects.json`) | ✅ |

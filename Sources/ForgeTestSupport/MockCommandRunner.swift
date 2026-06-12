@@ -58,13 +58,18 @@ extension MockCommandRunner {
     /// The returned runner is **stateful**: `tmux new-session` adds the session
     /// name to the live set and `tmux kill-session` removes it, so subsequent
     /// `has-session` calls reflect mutations made during a test.
+    ///
+    /// `deadSessions` exist (has-session succeeds) but their pane is dead —
+    /// the remain-on-exit leftover. Pre-seeded sessions report a creation
+    /// time of 42 seconds ago; sessions created during the test report "now".
     public static func simulating(
         listeningPorts: [Int: Int32] = [:],
         sessions: Set<String> = [],
+        deadSessions: Set<String> = [],
         javaHome: String? = nil,
         unhealthyPorts: Set<Int> = []
     ) -> MockCommandRunner {
-        let state = SimulationState(sessions: sessions, ports: listeningPorts)
+        let state = SimulationState(sessions: sessions.union(deadSessions), dead: deadSessions, ports: listeningPorts)
 
         return MockCommandRunner { call in
             switch call.executable {
@@ -93,6 +98,20 @@ extension MockCommandRunner {
                 // ["has-session", "-t", <name>]
                 return CommandResult(exitCode: state.hasSession(call.arguments[2]) ? 0 : 1)
 
+            case "tmux" where call.arguments.first == "list-panes":
+                // ["list-panes", "-t", <name>, "-F", "#{pane_dead}"]
+                guard state.hasSession(call.arguments[2]) else {
+                    return CommandResult(exitCode: 1, stderr: "can't find session")
+                }
+                return CommandResult(exitCode: 0, stdout: state.isDead(call.arguments[2]) ? "1\n" : "0\n")
+
+            case "tmux" where call.arguments.first == "display-message":
+                // ["display-message", "-p", "-t", <name>, "#{session_created}"]
+                guard let created = state.created(call.arguments[3]) else {
+                    return CommandResult(exitCode: 1, stderr: "can't find session")
+                }
+                return CommandResult(exitCode: 0, stdout: "\(Int(created.timeIntervalSince1970))\n")
+
             case "/usr/libexec/java_home":
                 guard let javaHome else { return CommandResult(exitCode: 1, stderr: "Unable to find any JVMs") }
                 return CommandResult(exitCode: 0, stdout: javaHome + "\n")
@@ -120,21 +139,39 @@ extension MockCommandRunner {
 private final class SimulationState: @unchecked Sendable {
     private let lock = NSLock()
     private var sessions: Set<String>
+    private var dead: Set<String>
+    private var createdAt: [String: Date]
     private var ports: [Int: Int32]
 
-    init(sessions: Set<String>, ports: [Int: Int32]) {
+    init(sessions: Set<String>, dead: Set<String>, ports: [Int: Int32]) {
         self.sessions = sessions
+        self.dead = dead
+        // Pre-seeded sessions look 42 seconds old, deterministic enough
+        // for startingFor assertions.
+        self.createdAt = Dictionary(uniqueKeysWithValues: sessions.map { ($0, Date().addingTimeInterval(-42)) })
         self.ports = ports
     }
 
     func hasSession(_ name: String) -> Bool {
         lock.lock(); defer { lock.unlock() }; return sessions.contains(name)
     }
+    func isDead(_ name: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }; return dead.contains(name)
+    }
+    func created(_ name: String) -> Date? {
+        lock.lock(); defer { lock.unlock() }; return createdAt[name]
+    }
     func addSession(_ name: String) {
-        lock.lock(); defer { lock.unlock() }; sessions.insert(name)
+        lock.lock(); defer { lock.unlock() }
+        sessions.insert(name)
+        dead.remove(name)
+        createdAt[name] = Date()
     }
     func removeSession(_ name: String) {
-        lock.lock(); defer { lock.unlock() }; sessions.remove(name)
+        lock.lock(); defer { lock.unlock() }
+        sessions.remove(name)
+        dead.remove(name)
+        createdAt[name] = nil
     }
     func pid(onPort port: Int) -> Int32? {
         lock.lock(); defer { lock.unlock() }; return ports[port]

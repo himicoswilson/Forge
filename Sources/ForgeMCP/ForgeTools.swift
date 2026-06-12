@@ -15,6 +15,8 @@ public struct StatusPayload: Codable, Sendable, Equatable {
     public let pid: Int32?
     public let memoryKB: Int?
     public let uptime: String?
+    /// How long the service has been in `starting` (e.g. "00:42"), nil otherwise.
+    public let startingFor: String?
 
     init(_ status: ServiceStatus, project: String) {
         self.project = project
@@ -24,6 +26,7 @@ public struct StatusPayload: Codable, Sendable, Equatable {
         pid = status.pid
         memoryKB = status.memoryKB
         uptime = status.uptime
+        startingFor = status.startingFor
     }
 }
 
@@ -60,6 +63,15 @@ public struct ForgeTools: Sendable {
         "description": "Project name — required only when the same service name exists in multiple registered projects",
     ]
 
+    private static func waitArg(_ description: String) -> Value {
+        ["type": "boolean", "description": .string(description)]
+    }
+
+    private static let timeoutArg: Value = [
+        "type": "integer",
+        "description": "Seconds to wait for UP before failing with the recent log tail attached (default 180)",
+    ]
+
     /// Schema for tools that accept one or more service names.
     private static func multiServiceSchema(extra: [String: Value] = [:]) -> Value {
         var props: [String: Value] = [
@@ -82,7 +94,7 @@ public struct ForgeTools: Sendable {
     public static let catalog: [Tool] = [
         Tool(
             name: "list_services",
-            description: "Status snapshot of every non-ignored service in all registered projects: up/starting/down, pid, port, memory, uptime",
+            description: "Status snapshot of every non-ignored service in all registered projects: up/starting/down, pid, port, memory, uptime, and startingFor (how long a starting service has been starting)",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -132,12 +144,10 @@ public struct ForgeTools: Sendable {
         ),
         Tool(
             name: "start_service",
-            description: "Launch one or more services in new tmux sessions. Pass wait: false to fire-and-forget without blocking.",
+            description: "Start one or more services in tmux sessions. Idempotent: services already up or starting are skipped (never an error), stale dead sessions are cleared first. By default blocks until every started/starting service reports UP.",
             inputSchema: multiServiceSchema(extra: [
-                "wait": [
-                    "type": "boolean",
-                    "description": "Wait for the Maven command to complete before returning (default: true). Set false to start in the background immediately.",
-                ],
+                "wait": waitArg("Wait until each service reports UP before returning (default: true). Set false to fire-and-forget."),
+                "timeoutSeconds": timeoutArg,
             ])
         ),
         Tool(
@@ -148,13 +158,19 @@ public struct ForgeTools: Sendable {
         ),
         Tool(
             name: "restart_service",
-            description: "Full restart of one or more services (stop + start). All restarts run in parallel.",
-            inputSchema: multiServiceSchema()
+            description: "Full restart of one or more services (stop + start), in parallel. By default blocks until each service reports UP; on timeout the error includes the recent log tail.",
+            inputSchema: multiServiceSchema(extra: [
+                "wait": waitArg("Wait until each restarted service reports UP before returning (default: true). Set false to return as soon as the restart is issued."),
+                "timeoutSeconds": timeoutArg,
+            ])
         ),
         Tool(
             name: "hotrestart_service",
-            description: "Recompile one or more services' Maven modules so Spring DevTools hot-reloads them. All compiles run in parallel.",
-            inputSchema: multiServiceSchema()
+            description: "Recompile one or more services' Maven modules so Spring DevTools hot-reloads them, then confirm each service reports UP again. All compiles run in parallel.",
+            inputSchema: multiServiceSchema(extra: [
+                "wait": waitArg("After compiling, wait until the service reports UP again (default: true). Set false to skip the confirmation."),
+                "timeoutSeconds": timeoutArg,
+            ])
         ),
     ]
 
@@ -162,6 +178,8 @@ public struct ForgeTools: Sendable {
 
     enum ToolError: Error {
         case badArguments(String)
+        /// Operation failed; message is already fully formatted (may embed a log tail).
+        case failed(String)
     }
 
     public func call(_ name: String, arguments: [String: Value]?) async throws -> CallTool.Result {
@@ -226,17 +244,21 @@ public struct ForgeTools: Sendable {
             case "start_service":
                 let pairs = try resolveServices(args, in: projects)
                 let wait = args["wait"]?.boolValue ?? true
-                if !wait {
-                    for (mgr, svc) in pairs {
-                        DispatchQueue.global(qos: .userInitiated).async { try? mgr.start(svc) }
-                    }
-                    let names = pairs.map { "\($0.0.config.name)/\($0.1.name)" }.joined(separator: ", ")
-                    return .init(content: [textContent("Queued for startup (not waiting): \(names)")])
-                }
+                let timeout = args["timeoutSeconds"]?.intValue ?? 180
                 let (lines, hadError) = concurrently(pairs) { mgr, svc in
-                    try mgr.start(svc)
-                    try mgr.waitForUp(svc)
-                    return "Started \(mgr.config.name)/\(svc.name) — UP on port \(svc.port)."
+                    let label = "\(mgr.config.name)/\(svc.name)"
+                    switch try mgr.startIfNeeded(svc) {
+                    case .alreadyUp:
+                        return "\(label): skipped — already up."
+                    case .alreadyStarting:
+                        guard wait else { return "\(label): skipped — already starting." }
+                        try waitForUpAttachingLogs(mgr, svc, timeout: timeout)
+                        return "\(label): already starting — waited until UP on port \(svc.port)."
+                    case .started:
+                        guard wait else { return "\(label): started (not waiting)." }
+                        try waitForUpAttachingLogs(mgr, svc, timeout: timeout)
+                        return "\(label): started — UP on port \(svc.port)."
+                    }
                 }
                 return .init(content: [textContent(lines.joined(separator: "\n"))], isError: hadError)
 
@@ -255,18 +277,32 @@ public struct ForgeTools: Sendable {
             // MARK: restart_service
             case "restart_service":
                 let pairs = try resolveServices(args, in: projects)
+                let wait = args["wait"]?.boolValue ?? true
+                let timeout = args["timeoutSeconds"]?.intValue ?? 180
                 let (lines, hadError) = concurrently(pairs) { mgr, svc in
+                    let label = "\(mgr.config.name)/\(svc.name)"
                     try mgr.restart(svc)
-                    return "Restarted \(mgr.config.name)/\(svc.name) (port \(svc.port) — state 'starting' until UP)."
+                    guard wait else { return "\(label): restarted (not waiting — state 'starting' until UP)." }
+                    try waitForUpAttachingLogs(mgr, svc, timeout: timeout)
+                    return "\(label): restarted — UP on port \(svc.port)."
                 }
                 return .init(content: [textContent(lines.joined(separator: "\n"))], isError: hadError)
 
             // MARK: hotrestart_service
             case "hotrestart_service":
                 let pairs = try resolveServices(args, in: projects)
+                let wait = args["wait"]?.boolValue ?? true
+                let timeout = args["timeoutSeconds"]?.intValue ?? 180
                 let (lines, hadError) = concurrently(pairs) { mgr, svc in
+                    let label = "\(mgr.config.name)/\(svc.name)"
+                    let module = mgr.config.module(for: svc)
                     try mgr.hotRestart(svc)
-                    return "Compiled '\(mgr.config.module(for: svc))' — Spring DevTools will reload \(mgr.config.name)/\(svc.name)."
+                    guard wait else { return "Compiled '\(module)' — Spring DevTools will reload \(label)." }
+                    guard mgr.status(of: svc).state != .down else {
+                        return "Compiled '\(module)', but \(label) is not running — nothing to reload."
+                    }
+                    try waitForUpAttachingLogs(mgr, svc, timeout: timeout)
+                    return "Compiled '\(module)' — \(label) reloaded, UP on port \(svc.port)."
                 }
                 return .init(content: [textContent(lines.joined(separator: "\n"))], isError: hadError)
 
@@ -295,6 +331,21 @@ public struct ForgeTools: Sendable {
         }
         let project = args["project"]?.stringValue
         return try names.map { try Workspace.resolve(in: projects, service: $0, project: project) }
+    }
+
+    /// Block until `svc` reports UP; on failure rethrow with the last 40 log
+    /// lines attached, saving the caller a follow-up `get_logs` round trip.
+    private func waitForUpAttachingLogs(_ mgr: ServiceManager, _ svc: ServiceConfig, timeout: Int) throws {
+        do {
+            try mgr.waitForUp(svc, timeoutSeconds: timeout)
+        } catch {
+            var message = Self.message(for: error)
+            if let tail = try? mgr.logs(of: svc, lines: 40),
+               !tail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                message += "\nLast 40 log lines:\n\(tail)"
+            }
+            throw ToolError.failed(message)
+        }
     }
 
     /// Run `work` for each (manager, service) pair in parallel; collect results or per-service error lines.
@@ -337,6 +388,7 @@ public struct ForgeTools: Sendable {
     private static func message(for error: Error) -> String {
         switch error {
         case ToolError.badArguments(let msg): return msg
+        case ToolError.failed(let msg): return msg
         case Workspace.ResolutionError.noProjects:
             return "No projects registered — add one in the Forge menu or set FORGE_PROJECT."
         case Workspace.ResolutionError.unknownProject(let name, let known):
