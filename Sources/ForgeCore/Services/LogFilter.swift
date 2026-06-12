@@ -39,6 +39,22 @@ public enum LogFilter {
         limit: Int = 100,
         now: Date = Date()
     ) throws -> String {
+        try apply(
+            to: text, regex: pattern.map(compile),
+            context: context, since: since, limit: limit, now: now
+        )
+    }
+
+    /// Same as the string-pattern overload, for callers that already
+    /// compiled (and thereby validated) the regex.
+    public static func apply(
+        to text: String,
+        regex: Regex<AnyRegexOutput>?,
+        context: Int = 0,
+        since: TimeInterval? = nil,
+        limit: Int = 100,
+        now: Date = Date()
+    ) throws -> String {
         // pipe-pane mirrors raw pty output, so real log files end lines with
         // CRLF — and Swift treats "\r\n" as ONE Character (grapheme cluster),
         // which `split(separator: "\n")` does not match. Split on
@@ -68,8 +84,7 @@ public enum LogFilter {
             }
         }
 
-        if let pattern {
-            let regex = try compile(pattern)
+        if let regex {
             let context = max(0, context)
             var blocks: [ClosedRange<Int>] = []
             for i in lines.indices where lines[i].contains(regex) {

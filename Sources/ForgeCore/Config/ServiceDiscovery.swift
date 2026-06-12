@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationXML)
+import FoundationXML
+#endif
 
 /// Statically discovers runnable Spring Boot services in a Maven
 /// multi-module project: follows `<modules>` from the root `pom.xml` and

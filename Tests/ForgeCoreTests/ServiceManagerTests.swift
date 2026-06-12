@@ -90,6 +90,104 @@ struct ServiceManagerTests {
         #expect(all.map(\.state) == [.up, .up, .down, .down])
     }
 
+    // MARK: - statusAll snapshot path
+    // statusAll interrogates the system once per call instead of per
+    // service; these mirror the single-service status assertions above so
+    // the two state machines can never drift apart.
+
+    @Test("statusAll: port listening → up, with pid + memory + uptime")
+    func statusAllUp() {
+        let all = manager(world(listeningPorts: [9201: 4242])).statusAll()
+        let auth = all.first { $0.service.name == "auth" }!
+        #expect(auth.state == .up)
+        #expect(auth.pid == 4242)
+        #expect(auth.memoryKB == 129024)
+        #expect(auth.uptime == "01:23:45")
+    }
+
+    @Test("statusAll: session alive but port silent → starting, with elapsed startingFor")
+    func statusAllStarting() {
+        let all = manager(world(sessions: ["wr-train"])).statusAll()
+        let train = all.first { $0.service.name == "train" }!
+        #expect(train.state == .starting)
+        // Simulated sessions are 42 seconds old.
+        #expect(train.startingFor?.hasPrefix("00:4") == true)
+    }
+
+    @Test("statusAll: port bound but actuator not UP → starting, startingFor falls back to process uptime")
+    func statusAllStartingWhileUnhealthy() {
+        let runner = MockCommandRunner.simulating(listeningPorts: [9201: 4242], unhealthyPorts: [9201])
+        let all = manager(runner).statusAll()
+        let auth = all.first { $0.service.name == "auth" }!
+        #expect(auth.state == .starting)
+        #expect(auth.pid == 4242)
+        #expect(auth.memoryKB == 129024)
+        // No tmux session to date the start from → process uptime.
+        #expect(auth.startingFor == "01:23:45")
+    }
+
+    @Test("statusAll: unhealthy port with a live session dates startingFor from the session")
+    func statusAllUnhealthyWithSession() {
+        let runner = MockCommandRunner.simulating(
+            listeningPorts: [9201: 4242], sessions: ["wr-auth"], unhealthyPorts: [9201]
+        )
+        let auth = manager(runner).statusAll().first { $0.service.name == "auth" }!
+        #expect(auth.state == .starting)
+        #expect(auth.startingFor?.hasPrefix("00:4") == true)
+    }
+
+    @Test("statusAll: session whose pane died → down, not starting")
+    func statusAllDeadPane() {
+        let all = manager(.simulating(deadSessions: ["wr-train"])).statusAll()
+        #expect(all.first { $0.service.name == "train" }!.state == .down)
+    }
+
+    @Test("statusAll spawns a fixed number of subprocesses, not per-service ones")
+    func statusAllSpawnCount() {
+        let runner = MockCommandRunner.simulating(listeningPorts: [8080: 1, 9201: 2], sessions: ["wr-train"])
+        let all = manager(runner).statusAll()
+        #expect(all.map(\.state) == [.up, .up, .down, .starting])
+
+        // 4 services, 2 bound ports, 1 session:
+        // 1 lsof + 1 ps + 1 list-sessions + 1 list-panes + 2 health curls.
+        let byExecutable = Dictionary(grouping: runner.calls, by: \.executable)
+        #expect(byExecutable["lsof"]?.count == 1)
+        #expect(byExecutable["ps"]?.count == 1)
+        #expect(byExecutable["tmux"]?.count == 2)
+        #expect(byExecutable["/usr/bin/curl"]?.count == 2)
+        // The per-service forms must be gone from this path entirely.
+        #expect(!runner.commandLines.contains { $0.contains("-ti:") })
+        #expect(!runner.commandLines.contains { $0.contains("has-session") })
+    }
+
+    @Test("statusAll with everything down and no tmux server costs exactly 2 spawns")
+    func statusAllAllDownSpawnCount() {
+        let runner = world()
+        let all = manager(runner).statusAll()
+        #expect(all.allSatisfy { $0.state == .down })
+        // lsof (no matches) + list-sessions (no server); ps and
+        // list-panes are skipped when there is nothing to ask about.
+        #expect(runner.commandLines == [
+            "lsof -nP -iTCP:8080,9201,9400,9700 -sTCP:LISTEN -Fpn",
+            "tmux list-sessions -F #{session_name}\t#{session_created}",
+        ])
+    }
+
+    @Test("statusAll(excluding:) only asks lsof about the remaining ports")
+    func statusAllExcludingPorts() {
+        let runner = world()
+        _ = manager(runner).statusAll(excluding: ["gateway", "train"])
+        #expect(runner.commandLines.first == "lsof -nP -iTCP:9201,9400 -sTCP:LISTEN -Fpn")
+    }
+
+    @Test("elapsedString formats like ps etime")
+    func elapsedStringFormat() {
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        #expect(ServiceManager.elapsedString(since: now.addingTimeInterval(-42), now: now) == "00:42")
+        #expect(ServiceManager.elapsedString(since: now.addingTimeInterval(-3_700), now: now) == "01:01:40")
+        #expect(ServiceManager.elapsedString(since: now.addingTimeInterval(60), now: now) == "00:00")
+    }
+
     // MARK: - Lifecycle
 
     /// The `new-session` invocation among all recorded calls.
