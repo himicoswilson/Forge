@@ -8,7 +8,7 @@ Local microservice manager for Spring Boot projects — native macOS GUI + MCP s
 
 - Visualizes service status in real time (port + actuator health, memory, uptime)
 - Start / stop / restart / hot-restart any service with one click
-- Streams live logs from each service's tmux pane; full history mirrored to `~/.forge/logs/<session>.log`
+- Mirrors each service's full output to `~/.forge/logs/<session>.log` (tmux pipe-pane) — the single log source for the GUI and MCP, searchable by regex/time window
 - Exposes an MCP server so AI agents can query status and trigger actions with precision
 
 ---
@@ -21,7 +21,7 @@ Forge.app
 ├── ServiceManager       — Swift layer; runs shell commands via Process
 │     ├── port check     — lsof -ti:<port>
 │     ├── health check   — curl /actuator/health (port bound ≠ ready)
-│     ├── tmux control   — new-session / kill-session / pipe-pane / capture-pane
+│     ├── tmux control   — new-session / kill-session / pipe-pane
 │     └── mvn compile    — hotrestart trigger
 └── MCP Server           — Streamable HTTP on http://127.0.0.1:27182/mcp
       └── exposes tools to AI agents (Claude Code, etc.)
@@ -37,7 +37,7 @@ Lifecycle tools take one or more services, are **idempotent**, and **block until
 |---|---|---|
 | `list_services` | `project?` | Status snapshot of every service in all registered projects: up/starting/down, pid, port, memory, uptime, `startingFor` |
 | `get_service` | `service, project?` | Status of one service |
-| `get_logs` | `service, project?, lines?, pattern?, context?, since?` | Service log from the durable file (`~/.forge/logs/<session>.log`), falling back to the tmux pane. Plain tail by default; `pattern` (regex) + `context` work like `grep -C`, `since` ("30s"/"5m"/"2h") windows by log line timestamps |
+| `get_logs` | `service, project?, lines?, pattern?, context?, since?` | Service log from the mirrored file (`~/.forge/logs/<session>.log` — only exists for services started by Forge). Plain tail by default; `pattern` (regex) + `context` work like `grep -C`, `since` ("30s"/"5m"/"2h") windows by log line timestamps |
 | `start_service` | `services[], project?, wait?, timeoutSeconds?` | `mvn install -pl <module> -am -DskipTests && …spring-boot-maven-plugin:run -pl <module>` in a new tmux session. Skips services already up/starting (never an error), clears stale dead sessions first |
 | `stop_service` | `services[], project?` | Kill the tmux session, then SIGTERM whatever still holds the port |
 | `restart_service` | `services[], project?, wait?, timeoutSeconds?` | Kill session → relaunch (full restart), then wait until UP |
@@ -57,7 +57,7 @@ Lifecycle tools take one or more services, are **idempotent**, and **block until
 ○ train     :9700   DOWN   —       [Start] [Restart]  [⚡]
 ```
 
-**Log drawer** — click any card to expand live log tail (tmux capture-pane, auto-scroll).
+**Logs** — "View Logs" on any service opens its mirrored log file (`~/.forge/logs/<session>.log`).
 
 ---
 
@@ -69,7 +69,7 @@ Lifecycle tools take one or more services, are **idempotent**, and **block until
 | Shell bridge | `Foundation.Process` | Run tmux / mvn commands directly |
 | MCP transport | Streamable HTTP (stateless) on `127.0.0.1:27182/mcp` | Current MCP spec; clients connect via URL with `"type": "http"` |
 | MCP protocol | Official `modelcontextprotocol/swift-sdk` | Supersedes the original hand-rolled HTTP/SSE plan |
-| Log streaming | Timer + `tmux capture-pane` poll | No dependency on pty |
+| Log capture | `tmux pipe-pane` → `~/.forge/logs/<session>.log` | Durable full history, no wrapping; the only log source |
 
 ---
 
@@ -125,6 +125,6 @@ All milestones are delivered (see CLAUDE.md for the running checklist).
 | M1 | ServiceManager Swift layer — all shell ops working, unit-tested | ✅ |
 | M2 | MCP server — all 7 tools, Streamable HTTP transport, Claude Code verified | ✅ |
 | M3 | SwiftUI window — service cards + start/stop/hotrestart buttons | ✅ |
-| M4 | Log drawer — live tail per service | ✅ |
+| M4 | Log access — mirrored log file per service | ✅ |
 | M5 | Menu bar icon — colour state, quick-access popover | ✅ |
 | M6 | Multi-project support — workspace + registry (`~/.forge/projects.json`) | ✅ |

@@ -69,9 +69,7 @@ public enum LogFilter {
         }
 
         if let pattern {
-            guard let regex = try? Regex(pattern) else {
-                throw QueryError.invalidPattern(pattern)
-            }
+            let regex = try compile(pattern)
             let context = max(0, context)
             var blocks: [ClosedRange<Int>] = []
             for i in lines.indices where lines[i].contains(regex) {
@@ -95,6 +93,15 @@ public enum LogFilter {
             lines = Array(lines.suffix(limit))
         }
         return (notes + lines).joined(separator: "\n")
+    }
+
+    /// Compiles a user-supplied pattern, mapping failure to `invalidPattern`.
+    /// Public so callers can validate arguments before doing I/O.
+    public static func compile(_ pattern: String) throws -> Regex<AnyRegexOutput> {
+        guard let regex = try? Regex(pattern) else {
+            throw QueryError.invalidPattern(pattern)
+        }
+        return regex
     }
 
     /// Timestamp at the start of a log line: Spring Boot's default

@@ -81,21 +81,4 @@ struct TmuxControllerTests {
         #expect(runner.commandLines == ["tmux kill-session -t wr-auth"])
     }
 
-    @Test("capturePane requests N lines of history and returns stdout")
-    func capturePane() throws {
-        let runner = MockCommandRunner { _ in
-            CommandResult(exitCode: 0, stdout: "Started AuthApplication in 4.2 seconds\n")
-        }
-        let tmux = TmuxController(runner: runner)
-        let logs = try tmux.capturePane(session: "wr-auth", lines: 200)
-        #expect(logs.contains("Started AuthApplication"))
-        #expect(runner.commandLines == ["tmux capture-pane -p -J -t wr-auth -S -200"])
-    }
-
-    @Test("capturePane with nil lines captures the entire scrollback")
-    func capturePaneAll() throws {
-        let runner = MockCommandRunner()
-        _ = try TmuxController(runner: runner).capturePane(session: "wr-auth", lines: nil)
-        #expect(runner.commandLines == ["tmux capture-pane -p -J -t wr-auth -S -"])
-    }
 }

@@ -329,24 +329,28 @@ struct ServiceManagerTests {
         return dir
     }
 
-    @Test("logs falls back to the tmux pane when no log file exists, default 100 lines")
-    func logs() throws {
-        let runner = MockCommandRunner { _ in
-            CommandResult(exitCode: 0, stdout: "log line\n")
+    @Test("logs throws a clear error when the log file doesn't exist")
+    func logsWithoutFile() {
+        #expect(throws: ServiceManager.LogError.noLogFile(path: "/logs/wr-auth.log")) {
+            try manager(world()).logs(of: config.service(named: "auth")!)
         }
-        let output = try manager(runner).logs(of: config.service(named: "auth")!)
-        #expect(output == "log line")
-        #expect(runner.commandLines == ["tmux capture-pane -p -J -t wr-auth -S -100"])
     }
 
-    @Test("logs prefers the durable log file over the tmux pane")
+    @Test("an invalid pattern is reported as such, not masked by a missing log file")
+    func logsInvalidPatternBeatsMissingFile() {
+        #expect(throws: LogFilter.QueryError.invalidPattern("[")) {
+            try manager(world()).logs(of: config.service(named: "auth")!, pattern: "[")
+        }
+    }
+
+    @Test("logs reads the mirrored log file without touching the shell")
     func logsFromFile() throws {
         let dir = try logsDir(content: "from the file\n")
         defer { try? FileManager.default.removeItem(at: dir) }
         let runner = world()
         let mgr = ServiceManager(config: config, projectRoot: root, runner: runner, logsDirectory: dir)
         #expect(try mgr.logs(of: config.service(named: "auth")!) == "from the file")
-        #expect(!runner.commandLines.contains { $0.contains("capture-pane") })
+        #expect(runner.calls.isEmpty)
     }
 
     @Test("logs with a pattern greps the log file with context")
@@ -369,13 +373,21 @@ struct ServiceManagerTests {
         #expect(!output.contains("boot ok"))
     }
 
-    @Test("logs filtering via the pane fallback captures the entire scrollback")
-    func logsFilteredFromPane() throws {
-        let runner = MockCommandRunner { _ in
-            CommandResult(exitCode: 0, stdout: "fine\nERROR bad\nfine\n")
+    @Test("start pre-creates the log file and leaves a marker when pipe-pane fails")
+    func startPipePaneFailureMarker() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let runner = MockCommandRunner { call in
+            call.executable == "tmux" && call.arguments.first == "pipe-pane"
+                ? CommandResult(exitCode: 1, stderr: "no such option")
+                : CommandResult(exitCode: 0)
         }
-        let output = try manager(runner).logs(of: config.service(named: "auth")!, pattern: "ERROR")
-        #expect(output == "ERROR bad")
-        #expect(runner.commandLines == ["tmux capture-pane -p -J -t wr-auth -S -"])
+        let mgr = ServiceManager(config: config, projectRoot: root, runner: runner, logsDirectory: dir)
+
+        try mgr.start(config.service(named: "train")!)
+
+        let content = try String(contentsOf: dir.appendingPathComponent("wr-train.log"), encoding: .utf8)
+        #expect(content.contains("pipe-pane failed"))
     }
 }

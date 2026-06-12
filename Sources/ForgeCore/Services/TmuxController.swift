@@ -63,15 +63,4 @@ public struct TmuxController: Sendable {
         }
     }
 
-    /// Last `lines` lines of the session's pane; `nil` captures the entire
-    /// scrollback (`-S -`). `-J` re-joins lines the terminal width wrapped,
-    /// so one log entry stays one line.
-    public func capturePane(session: String, lines: Int?) throws -> String {
-        let from = lines.map { "-\($0)" } ?? "-"
-        let result = try runner.run("tmux", ["capture-pane", "-p", "-J", "-t", session, "-S", from])
-        guard result.succeeded else {
-            throw CommandError.failed(command: "tmux capture-pane", exitCode: result.exitCode, stderr: result.stderr)
-        }
-        return result.stdout
-    }
 }

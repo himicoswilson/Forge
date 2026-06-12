@@ -124,7 +124,7 @@ public struct ForgeTools: Sendable {
         ),
         Tool(
             name: "get_logs",
-            description: "Service log, tail or regex search. Reads the durable log file (~/.forge/logs/<session>.log — full history since start, no line wrapping), falling back to the tmux pane scrollback. Combine pattern + context to jump straight to exception stacks instead of paging through a plain tail.",
+            description: "Service log, tail or regex search, from the durable log file (~/.forge/logs/<session>.log — full history since start; only exists for services started by Forge). Combine pattern + context to jump straight to exception stacks instead of paging through a plain tail.",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -249,14 +249,20 @@ public struct ForgeTools: Sendable {
             // MARK: get_logs
             case "get_logs":
                 let (mgr, svc) = try resolveSingle(args, in: projects)
+                let pattern = args["pattern"]?.stringValue
+                let since = try args["since"]?.stringValue.map(LogFilter.parseDuration)
                 let output = try mgr.logs(
                     of: svc,
                     lines: args["lines"]?.intValue ?? 100,
-                    pattern: args["pattern"]?.stringValue,
+                    pattern: pattern,
                     context: args["context"]?.intValue ?? 0,
-                    since: args["since"]?.stringValue.map(LogFilter.parseDuration)
+                    since: since
                 )
-                return .init(content: [textContent(output.isEmpty ? "(no matching log lines)" : output)])
+                guard output.isEmpty else {
+                    return .init(content: [textContent(output)])
+                }
+                let empty = pattern != nil || since != nil ? "(no matching log lines)" : "(log is empty)"
+                return .init(content: [textContent(empty)])
 
             // MARK: start_service
             case "start_service":
@@ -409,6 +415,8 @@ public struct ForgeTools: Sendable {
         case ToolError.failed(let msg): return msg
         case LogFilter.QueryError.invalidPattern(let pattern):
             return "Invalid regex pattern '\(pattern)'."
+        case ServiceManager.LogError.noLogFile(let path):
+            return "No log file at \(path) — was the service started by Forge? Logs are only mirrored for sessions Forge launches."
         case LogFilter.QueryError.invalidDuration(let duration):
             return "Invalid duration '\(duration)' — use forms like \"30s\", \"5m\", \"2h\"."
         case Workspace.ResolutionError.noProjects:

@@ -154,50 +154,14 @@ struct ForgeMCPTests {
         #expect(text(content).contains("Missing required argument 'service'"))
     }
 
-    @Test("get_logs tails the tmux pane with the requested line count")
-    func getLogs() async throws {
-        let runner = MockCommandRunner { call in
-            call.executable == "tmux" && call.arguments.first == "capture-pane"
-                ? CommandResult(exitCode: 0, stdout: "Started AuthApplication in 4.2 seconds\n")
-                : CommandResult(exitCode: 0)
-        }
-        let client = try await connect(runner)
+    @Test("get_logs without a log file explains that the file is the only source")
+    func getLogsNoFile() async throws {
+        let client = try await connect(.simulating())
         let (content, isError) = try await client.callTool(name: "get_logs", arguments: ["service": "auth", "lines": 50])
-        #expect(isError != true)
-        #expect(text(content).contains("Started AuthApplication"))
-        #expect(runner.commandLines.contains("tmux capture-pane -p -J -t wr-auth -S -50"))
-    }
-
-    @Test("get_logs with pattern + context returns just the exception block, from the full history")
-    func getLogsFiltered() async throws {
-        let runner = MockCommandRunner { call in
-            call.executable == "tmux" && call.arguments.first == "capture-pane"
-                ? CommandResult(exitCode: 0, stdout: "boot ok\n2026-06-12 ERROR boom\n\tat com.foo.Bar(Bar.java:10)\nmore noise\n")
-                : CommandResult(exitCode: 0)
-        }
-        let client = try await connect(runner)
-        let (content, isError) = try await client.callTool(
-            name: "get_logs", arguments: ["service": "auth", "pattern": "Exception|ERROR", "context": 1])
-        #expect(isError != true)
-        #expect(text(content).contains("ERROR boom"))
-        #expect(text(content).contains("at com.foo.Bar")) // the +1 context line
-        #expect(!text(content).contains("more noise")) // outside the context window
-        // Filtering captures the entire scrollback, not just the last N lines.
-        #expect(runner.commandLines.contains("tmux capture-pane -p -J -t wr-auth -S -"))
-    }
-
-    @Test("get_logs with no matches says so instead of returning empty content")
-    func getLogsNoMatches() async throws {
-        let runner = MockCommandRunner { call in
-            call.executable == "tmux" && call.arguments.first == "capture-pane"
-                ? CommandResult(exitCode: 0, stdout: "all good\n")
-                : CommandResult(exitCode: 0)
-        }
-        let client = try await connect(runner)
-        let (content, isError) = try await client.callTool(
-            name: "get_logs", arguments: ["service": "auth", "pattern": "ERROR"])
-        #expect(isError != true)
-        #expect(text(content) == "(no matching log lines)")
+        #expect(isError == true)
+        #expect(text(content).contains("No log file"))
+        #expect(text(content).contains("wr-auth.log"))
+        #expect(text(content).contains("started by Forge"))
     }
 
     @Test("get_logs end-to-end: real CRLF+ANSI log file from disk, through the MCP handler")
@@ -433,21 +397,45 @@ struct ForgeMCPTests {
 
     @Test("restart_service timeout fails with the recent log tail attached")
     func restartServiceTimeout() async throws {
+        // Real temp logs dir; the scripted pipe-pane "mirrors" some output
+        // into the log file, exactly like production.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-mcp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
         let runner = MockCommandRunner { call in
             switch call.executable {
-            case "tmux" where call.arguments.first == "capture-pane":
-                return CommandResult(exitCode: 0, stdout: "Caused by: BeanCreationException: oops\n")
+            case "tmux" where call.arguments.first == "pipe-pane":
+                try? "Caused by: BeanCreationException: oops\r\n"
+                    .write(to: dir.appendingPathComponent("wr-auth.log"), atomically: true, encoding: .utf8)
+                return CommandResult(exitCode: 0)
             case "tmux" where call.arguments.first == "list-panes":
                 return CommandResult(exitCode: 0, stdout: "0\n")
             case "tmux":
-                return CommandResult(exitCode: 0) // has-session, kill-session, new-session, pipe-pane
+                return CommandResult(exitCode: 0) // has-session, kill-session, new-session
             case "lsof":
                 return CommandResult(exitCode: 1) // port never binds
             default:
                 return CommandResult(exitCode: 0)
             }
         }
-        let client = try await connect(runner)
+        let workspace = Workspace(runner: runner)
+        await workspace.register(ServiceManager(
+            config: ForgeConfig(
+                name: "cloud-a", prefix: "wr",
+                services: [ServiceConfig(name: "auth", port: 9201)]
+            ),
+            projectRoot: URL(fileURLWithPath: "/projects/cloud-a"),
+            runner: runner,
+            logsDirectory: dir
+        ))
+        let server = await ForgeMCPServer.makeServer(tools: ForgeTools(workspace: workspace))
+        let (clientTransport, serverTransport) = await InMemoryTransport.createConnectedPair()
+        try await server.start(transport: serverTransport)
+        let client = Client(name: "forge-tests", version: "1.0.0")
+        try await client.connect(transport: clientTransport)
+
         let (content, isError) = try await client.callTool(
             name: "restart_service", arguments: ["services": ["auth"], "timeoutSeconds": 0])
         #expect(isError == true)

@@ -130,9 +130,8 @@ public struct ServiceManager: Sendable {
         if tmux.hasSession(session), tmux.isPaneDead(session) {
             try? tmux.killSession(session)
         }
-        try? FileManager.default.removeItem(
-            at: logsDirectory.appendingPathComponent("\(session).log")
-        )
+        let logFile = logsDirectory.appendingPathComponent("\(session).log")
+        try? FileManager.default.removeItem(at: logFile)
         let module = config.module(for: service)
         let env = javaHome().map { "env JAVA_HOME=\"\($0)\" " } ?? ""
         let command = "\(env)mvn install -pl \(module) -am -DskipTests"
@@ -142,11 +141,18 @@ public struct ServiceManager: Sendable {
             command: command,
             workingDirectory: projectRoot
         )
-        // Mirror the session's output to a durable log file — capture-pane
-        // only holds the bounded pane history. Best effort: a missing log
-        // must never block a start.
+        // The mirrored file is the only log source (there is no pane
+        // fallback), so make sure it exists from the first instant, and
+        // leave a visible marker if mirroring can't be attached — never
+        // block the start over logging.
         try? FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
-        try? tmux.pipePane(session: session, toFile: logsDirectory.appendingPathComponent("\(session).log").path)
+        FileManager.default.createFile(atPath: logFile.path, contents: nil)
+        do {
+            try tmux.pipePane(session: session, toFile: logFile.path)
+        } catch {
+            try? Data("(forge: tmux pipe-pane failed — session output is not being mirrored: \(error))\n".utf8)
+                .write(to: logFile)
+        }
     }
 
     /// Kills the service's tmux session, then SIGTERMs whatever still holds
@@ -249,10 +255,15 @@ public struct ServiceManager: Sendable {
 
     // MARK: - Logs
 
-    /// Log text for a service. Prefers the durable pipe-pane log file —
-    /// full history since start, no terminal-width wrapping — and falls
-    /// back to the tmux pane scrollback when the file doesn't exist
-    /// (service started outside Forge, or an older session).
+    public enum LogError: Error, Equatable {
+        /// The session's mirrored log file doesn't exist — the service
+        /// wasn't started by Forge (which attaches pipe-pane on start).
+        case noLogFile(path: String)
+    }
+
+    /// Log text for a service, read from the durable pipe-pane mirror —
+    /// full history since start, no terminal-width wrapping. There is no
+    /// other source: a service started outside Forge has no log here.
     ///
     /// - Parameters:
     ///   - lines: Cap on returned lines, tail-biased (default 100).
@@ -266,16 +277,16 @@ public struct ServiceManager: Sendable {
         context: Int = 0,
         since: TimeInterval? = nil
     ) throws -> String {
-        let session = config.sessionName(for: service)
-        let file = logsDirectory.appendingPathComponent("\(session).log")
-        let raw: String
-        if let text = try? String(contentsOf: file, encoding: .utf8) {
-            raw = text
-        } else {
-            // Filtering needs the full history; a plain tail only the last N.
-            let filtering = pattern != nil || since != nil
-            raw = try tmux.capturePane(session: session, lines: filtering ? nil : lines)
+        // Validate query arguments first: a bad pattern should be reported
+        // as such, not masked by a missing log file.
+        if let pattern { _ = try LogFilter.compile(pattern) }
+        let file = logsDirectory.appendingPathComponent("\(config.sessionName(for: service)).log")
+        guard let data = try? Data(contentsOf: file) else {
+            throw LogError.noLogFile(path: file.path)
         }
+        // Lossy UTF-8 decode: a stray non-UTF-8 byte (GBK output, binary
+        // noise) must not take down the whole log.
+        let raw = String(decoding: data, as: UTF8.self)
         return try LogFilter.apply(to: raw, pattern: pattern, context: context, since: since, limit: lines)
     }
 }
