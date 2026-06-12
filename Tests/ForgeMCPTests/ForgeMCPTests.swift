@@ -165,7 +165,57 @@ struct ForgeMCPTests {
         let (content, isError) = try await client.callTool(name: "get_logs", arguments: ["service": "auth", "lines": 50])
         #expect(isError != true)
         #expect(text(content).contains("Started AuthApplication"))
-        #expect(runner.commandLines.contains("tmux capture-pane -p -t wr-auth -S -50"))
+        #expect(runner.commandLines.contains("tmux capture-pane -p -J -t wr-auth -S -50"))
+    }
+
+    @Test("get_logs with pattern + context returns just the exception block, from the full history")
+    func getLogsFiltered() async throws {
+        let runner = MockCommandRunner { call in
+            call.executable == "tmux" && call.arguments.first == "capture-pane"
+                ? CommandResult(exitCode: 0, stdout: "boot ok\n2026-06-12 ERROR boom\n\tat com.foo.Bar(Bar.java:10)\nmore noise\n")
+                : CommandResult(exitCode: 0)
+        }
+        let client = try await connect(runner)
+        let (content, isError) = try await client.callTool(
+            name: "get_logs", arguments: ["service": "auth", "pattern": "Exception|ERROR", "context": 1])
+        #expect(isError != true)
+        #expect(text(content).contains("ERROR boom"))
+        #expect(text(content).contains("at com.foo.Bar")) // the +1 context line
+        #expect(!text(content).contains("more noise")) // outside the context window
+        // Filtering captures the entire scrollback, not just the last N lines.
+        #expect(runner.commandLines.contains("tmux capture-pane -p -J -t wr-auth -S -"))
+    }
+
+    @Test("get_logs with no matches says so instead of returning empty content")
+    func getLogsNoMatches() async throws {
+        let runner = MockCommandRunner { call in
+            call.executable == "tmux" && call.arguments.first == "capture-pane"
+                ? CommandResult(exitCode: 0, stdout: "all good\n")
+                : CommandResult(exitCode: 0)
+        }
+        let client = try await connect(runner)
+        let (content, isError) = try await client.callTool(
+            name: "get_logs", arguments: ["service": "auth", "pattern": "ERROR"])
+        #expect(isError != true)
+        #expect(text(content) == "(no matching log lines)")
+    }
+
+    @Test("get_logs rejects an invalid regex with isError")
+    func getLogsInvalidPattern() async throws {
+        let client = try await connect(.simulating())
+        let (content, isError) = try await client.callTool(
+            name: "get_logs", arguments: ["service": "auth", "pattern": "["])
+        #expect(isError == true)
+        #expect(text(content).contains("Invalid regex pattern"))
+    }
+
+    @Test("get_logs rejects an invalid since duration with isError")
+    func getLogsInvalidSince() async throws {
+        let client = try await connect(.simulating())
+        let (content, isError) = try await client.callTool(
+            name: "get_logs", arguments: ["service": "auth", "since": "yesterday"])
+        #expect(isError == true)
+        #expect(text(content).contains("Invalid duration 'yesterday'"))
     }
 
     @Test("start_service launches the built-in mvn command in tmux and waits until UP")

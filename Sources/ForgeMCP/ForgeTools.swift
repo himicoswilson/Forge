@@ -124,7 +124,7 @@ public struct ForgeTools: Sendable {
         ),
         Tool(
             name: "get_logs",
-            description: "Last N lines from the service's tmux pane (live scrollback, not the log file)",
+            description: "Service log, tail or regex search. Reads the durable log file (~/.forge/logs/<session>.log — full history since start, no line wrapping), falling back to the tmux pane scrollback. Combine pattern + context to jump straight to exception stacks instead of paging through a plain tail.",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -135,7 +135,19 @@ public struct ForgeTools: Sendable {
                     "project": projectArg,
                     "lines": [
                         "type": "integer",
-                        "description": "Number of log lines to return (default 100)",
+                        "description": "Maximum lines to return, keeping the most recent (default 100)",
+                    ],
+                    "pattern": [
+                        "type": "string",
+                        "description": "Regex — return only matching lines (e.g. \"Exception|ERROR\") instead of a plain tail",
+                    ],
+                    "context": [
+                        "type": "integer",
+                        "description": "With pattern: also include N lines around each match, like grep -C (default 0)",
+                    ],
+                    "since": [
+                        "type": "string",
+                        "description": "Only entries from the last N seconds/minutes/hours — \"30s\", \"5m\", \"2h\" — judged by log line timestamps",
                     ],
                 ],
                 "required": ["service"],
@@ -237,8 +249,14 @@ public struct ForgeTools: Sendable {
             // MARK: get_logs
             case "get_logs":
                 let (mgr, svc) = try resolveSingle(args, in: projects)
-                let lines = args["lines"]?.intValue ?? 100
-                return .init(content: [textContent(try mgr.logs(of: svc, lines: lines))])
+                let output = try mgr.logs(
+                    of: svc,
+                    lines: args["lines"]?.intValue ?? 100,
+                    pattern: args["pattern"]?.stringValue,
+                    context: args["context"]?.intValue ?? 0,
+                    since: args["since"]?.stringValue.map(LogFilter.parseDuration)
+                )
+                return .init(content: [textContent(output.isEmpty ? "(no matching log lines)" : output)])
 
             // MARK: start_service
             case "start_service":
@@ -389,6 +407,10 @@ public struct ForgeTools: Sendable {
         switch error {
         case ToolError.badArguments(let msg): return msg
         case ToolError.failed(let msg): return msg
+        case LogFilter.QueryError.invalidPattern(let pattern):
+            return "Invalid regex pattern '\(pattern)'."
+        case LogFilter.QueryError.invalidDuration(let duration):
+            return "Invalid duration '\(duration)' — use forms like \"30s\", \"5m\", \"2h\"."
         case Workspace.ResolutionError.noProjects:
             return "No projects registered — add one in the Forge menu or set FORGE_PROJECT."
         case Workspace.ResolutionError.unknownProject(let name, let known):

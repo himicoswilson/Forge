@@ -37,7 +37,7 @@ Lifecycle tools take one or more services, are **idempotent**, and **block until
 |---|---|---|
 | `list_services` | `project?` | Status snapshot of every service in all registered projects: up/starting/down, pid, port, memory, uptime, `startingFor` |
 | `get_service` | `service, project?` | Status of one service |
-| `get_logs` | `service, project?, lines?` | Last N lines from the service's tmux pane |
+| `get_logs` | `service, project?, lines?, pattern?, context?, since?` | Service log from the durable file (`~/.forge/logs/<session>.log`), falling back to the tmux pane. Plain tail by default; `pattern` (regex) + `context` work like `grep -C`, `since` ("30s"/"5m"/"2h") windows by log line timestamps |
 | `start_service` | `services[], project?, wait?, timeoutSeconds?` | `mvn install -pl <module> -am -DskipTests && …spring-boot-maven-plugin:run -pl <module>` in a new tmux session. Skips services already up/starting (never an error), clears stale dead sessions first |
 | `stop_service` | `services[], project?` | Kill the tmux session, then SIGTERM whatever still holds the port |
 | `restart_service` | `services[], project?, wait?, timeoutSeconds?` | Kill session → relaunch (full restart), then wait until UP |

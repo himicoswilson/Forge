@@ -319,13 +319,63 @@ struct ServiceManagerTests {
 
     // MARK: - Logs
 
-    @Test("logs tails the service's tmux pane, default 100 lines")
+    /// Real temp directory holding a pre-written `wr-auth.log` — the one
+    /// place file I/O is exercised (still no shell, no tmux).
+    private func logsDir(content: String) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-tests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try content.write(to: dir.appendingPathComponent("wr-auth.log"), atomically: true, encoding: .utf8)
+        return dir
+    }
+
+    @Test("logs falls back to the tmux pane when no log file exists, default 100 lines")
     func logs() throws {
         let runner = MockCommandRunner { _ in
             CommandResult(exitCode: 0, stdout: "log line\n")
         }
         let output = try manager(runner).logs(of: config.service(named: "auth")!)
-        #expect(output == "log line\n")
-        #expect(runner.commandLines == ["tmux capture-pane -p -t wr-auth -S -100"])
+        #expect(output == "log line")
+        #expect(runner.commandLines == ["tmux capture-pane -p -J -t wr-auth -S -100"])
+    }
+
+    @Test("logs prefers the durable log file over the tmux pane")
+    func logsFromFile() throws {
+        let dir = try logsDir(content: "from the file\n")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let runner = world()
+        let mgr = ServiceManager(config: config, projectRoot: root, runner: runner, logsDirectory: dir)
+        #expect(try mgr.logs(of: config.service(named: "auth")!) == "from the file")
+        #expect(!runner.commandLines.contains { $0.contains("capture-pane") })
+    }
+
+    @Test("logs with a pattern greps the log file with context")
+    func logsFiltered() throws {
+        let dir = try logsDir(content: """
+            boot ok
+            noise
+            2026-06-12 15:00:00 ERROR boom
+            \tat com.foo.Bar(Bar.java:10)
+            more noise
+            """)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let mgr = ServiceManager(config: config, projectRoot: root, runner: world(), logsDirectory: dir)
+
+        let output = try mgr.logs(of: config.service(named: "auth")!, pattern: "ERROR|Exception", context: 1)
+
+        #expect(output.contains("ERROR boom"))
+        #expect(output.contains("at com.foo.Bar"))
+        #expect(output.contains("noise")) // context line before the match
+        #expect(!output.contains("boot ok"))
+    }
+
+    @Test("logs filtering via the pane fallback captures the entire scrollback")
+    func logsFilteredFromPane() throws {
+        let runner = MockCommandRunner { _ in
+            CommandResult(exitCode: 0, stdout: "fine\nERROR bad\nfine\n")
+        }
+        let output = try manager(runner).logs(of: config.service(named: "auth")!, pattern: "ERROR")
+        #expect(output == "ERROR bad")
+        #expect(runner.commandLines == ["tmux capture-pane -p -J -t wr-auth -S -"])
     }
 }

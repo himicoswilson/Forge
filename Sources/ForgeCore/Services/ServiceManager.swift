@@ -249,7 +249,33 @@ public struct ServiceManager: Sendable {
 
     // MARK: - Logs
 
-    public func logs(of service: ServiceConfig, lines: Int = 100) throws -> String {
-        try tmux.capturePane(session: config.sessionName(for: service), lines: lines)
+    /// Log text for a service. Prefers the durable pipe-pane log file —
+    /// full history since start, no terminal-width wrapping — and falls
+    /// back to the tmux pane scrollback when the file doesn't exist
+    /// (service started outside Forge, or an older session).
+    ///
+    /// - Parameters:
+    ///   - lines: Cap on returned lines, tail-biased (default 100).
+    ///   - pattern: Regex; keep only matching lines, ± `context` lines each.
+    ///   - since: Only entries from the last N seconds, judged by line
+    ///     timestamps (untimestamped lines inherit the previous entry's).
+    public func logs(
+        of service: ServiceConfig,
+        lines: Int = 100,
+        pattern: String? = nil,
+        context: Int = 0,
+        since: TimeInterval? = nil
+    ) throws -> String {
+        let session = config.sessionName(for: service)
+        let file = logsDirectory.appendingPathComponent("\(session).log")
+        let raw: String
+        if let text = try? String(contentsOf: file, encoding: .utf8) {
+            raw = text
+        } else {
+            // Filtering needs the full history; a plain tail only the last N.
+            let filtering = pattern != nil || since != nil
+            raw = try tmux.capturePane(session: session, lines: filtering ? nil : lines)
+        }
+        return try LogFilter.apply(to: raw, pattern: pattern, context: context, since: since, limit: lines)
     }
 }
