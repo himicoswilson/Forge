@@ -74,22 +74,89 @@ public struct ServiceManager: Sendable {
     /// Elapsed time since the session was created, formatted like `ps` etime
     /// ("00:42" / "01:23:45"). nil when the session doesn't exist.
     private func startingDuration(session: String) -> String? {
-        guard let created = tmux.sessionCreated(session) else { return nil }
-        let total = max(0, Int(Date().timeIntervalSince(created)))
+        tmux.sessionCreated(session).map { Self.elapsedString(since: $0) }
+    }
+
+    /// `ps` etime formatting shared by the single-service and snapshot
+    /// status paths so they can never drift apart.
+    static func elapsedString(since created: Date, now: Date = Date()) -> String {
+        let total = max(0, Int(now.timeIntervalSince(created)))
         let (h, m, s) = (total / 3600, total / 60 % 60, total % 60)
         return h > 0
             ? String(format: "%02d:%02d:%02d", h, m, s)
             : String(format: "%02d:%02d", m, s)
     }
 
+    /// Point-in-time system view captured in a fixed number of subprocess
+    /// calls (≤4), independent of service count — the per-tick polling cost
+    /// used to grow by 2–6 spawns per service.
+    struct SystemSnapshot: Sendable {
+        struct Session: Sendable {
+            let created: Date
+            let paneDead: Bool
+        }
+        /// LISTEN pids per port.
+        let listeners: [Int: [Int32]]
+        /// rss/etime per bound pid.
+        let stats: [Int32: PortChecker.ProcessStats]
+        /// tmux session name → info.
+        let sessions: [String: Session]
+    }
+
+    /// One lsof + one ps + one list-sessions + one list-panes (each skipped
+    /// when it has nothing to ask about).
+    func captureSnapshot(forPorts portList: [Int]) -> SystemSnapshot {
+        let listeners = ports.listeningPids(onPorts: portList)
+        var boundPids: [Int32] = []
+        for pids in listeners.values {
+            for pid in pids where !boundPids.contains(pid) { boundPids.append(pid) }
+        }
+        let stats = ports.processStats(of: boundPids)
+        let created = tmux.listSessions()
+        let dead = created.isEmpty ? [:] : tmux.deadPanes()
+        let sessions = Dictionary(uniqueKeysWithValues: created.map { name, date in
+            (name, SystemSnapshot.Session(created: date, paneDead: dead[name] ?? false))
+        })
+        return SystemSnapshot(listeners: listeners, stats: stats, sessions: sessions)
+    }
+
+    /// Same state machine as `status(of:)`, reading the pre-captured
+    /// snapshot instead of spawning lsof/ps/tmux per service. The health
+    /// curl still runs here — it is per-port by nature.
+    func status(of service: ServiceConfig, in snapshot: SystemSnapshot) -> ServiceStatus {
+        let session = config.sessionName(for: service)
+        if let pid = snapshot.listeners[service.port]?.first {
+            let info = snapshot.stats[pid]
+            switch health.check(port: service.port) {
+            case .ready, .noActuator:
+                return ServiceStatus(service: service, state: .up, pid: pid, memoryKB: info?.memoryKB, uptime: info?.uptime)
+            case .notReady:
+                return ServiceStatus(
+                    service: service, state: .starting, pid: pid,
+                    memoryKB: info?.memoryKB, uptime: info?.uptime,
+                    startingFor: snapshot.sessions[session].map { Self.elapsedString(since: $0.created) } ?? info?.uptime
+                )
+            }
+        }
+        if let sess = snapshot.sessions[session] {
+            if sess.paneDead {
+                return ServiceStatus(service: service, state: .down)
+            }
+            return ServiceStatus(service: service, state: .starting, startingFor: Self.elapsedString(since: sess.created))
+        }
+        return ServiceStatus(service: service, state: .down)
+    }
+
     /// Returns status for every service not in `excluding`, checked in parallel.
-    /// Results are returned in config order.
+    /// Results are returned in config order. The system is interrogated once
+    /// up front (see `SystemSnapshot`); only health checks fan out.
     public func statusAll(excluding: Set<String> = []) -> [ServiceStatus] {
         let services = config.services.filter { !excluding.contains($0.name) }
         guard !services.isEmpty else { return [] }
+        let snapshot = captureSnapshot(forPorts: services.map(\.port))
         let box = ConcurrentBox<ServiceStatus>()
         DispatchQueue.concurrentPerform(iterations: services.count) { i in
-            box.set(status(of: services[i]), at: i)
+            box.set(status(of: services[i], in: snapshot), at: i)
         }
         return box.collect(count: services.count)
     }
@@ -279,7 +346,7 @@ public struct ServiceManager: Sendable {
     ) throws -> String {
         // Validate query arguments first: a bad pattern should be reported
         // as such, not masked by a missing log file.
-        if let pattern { _ = try LogFilter.compile(pattern) }
+        let regex = try pattern.map(LogFilter.compile)
         let file = logsDirectory.appendingPathComponent("\(config.sessionName(for: service)).log")
         guard let data = try? Data(contentsOf: file) else {
             throw LogError.noLogFile(path: file.path)
@@ -287,6 +354,6 @@ public struct ServiceManager: Sendable {
         // Lossy UTF-8 decode: a stray non-UTF-8 byte (GBK output, binary
         // noise) must not take down the whole log.
         let raw = String(decoding: data, as: UTF8.self)
-        return try LogFilter.apply(to: raw, pattern: pattern, context: context, since: since, limit: lines)
+        return try LogFilter.apply(to: raw, regex: regex, context: context, since: since, limit: lines)
     }
 }
