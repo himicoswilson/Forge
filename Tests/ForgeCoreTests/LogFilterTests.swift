@@ -47,6 +47,22 @@ struct LogFilterTests {
         }
     }
 
+    @Test("CRLF line endings (real pipe-pane files) split correctly — '\\r\\n' is one Swift Character")
+    func crlfSplitting() throws {
+        // Regression: split(separator: "\n") silently matched nothing here,
+        // because Swift folds "\r\n" into a single grapheme cluster — the
+        // whole file became one giant "line" and every filter degenerated.
+        let text = "ok\r\nERROR boom\r\nok\r\n"
+        #expect(try LogFilter.apply(to: text, pattern: "ERROR") == "ERROR boom")
+        #expect(try LogFilter.apply(to: text, limit: 2) == "… (showing last 2 of 3 lines)\nERROR boom\nok")
+    }
+
+    @Test("lone \\r progress rewrites split into frames instead of merging lines")
+    func carriageReturnFrames() throws {
+        let text = "Progress (1): 10%\rProgress (2): 99%\r\nDone\r\n"
+        #expect(try LogFilter.apply(to: text, pattern: "Done") == "Done")
+    }
+
     @Test("ANSI colour codes are stripped before matching")
     func ansiStripped() throws {
         let output = try LogFilter.apply(to: "\u{1B}[31mERROR\u{1B}[0m boom\nok\n", pattern: "^ERROR")

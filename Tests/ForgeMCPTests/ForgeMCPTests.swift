@@ -200,6 +200,78 @@ struct ForgeMCPTests {
         #expect(text(content) == "(no matching log lines)")
     }
 
+    @Test("get_logs end-to-end: real CRLF+ANSI log file from disk, through the MCP handler")
+    func getLogsRealFile() async throws {
+        // The one test that exercises the full production chain with real
+        // file I/O: MCP arguments → file-reading branch → LogFilter. The
+        // file deliberately mimics pipe-pane output: CRLF endings + ANSI.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forge-mcp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        var content = "[\u{1B}[1;34mINFO\u{1B}[m] Scanning for projects...\r\n"
+        content += (1...50).map { "[INFO] building module \($0)" }.joined(separator: "\r\n") + "\r\n"
+        content += "2020-01-01 00:00:01 INFO Started GatewayApplication in 6.1 seconds\r\n"
+        content += "2020-01-01 00:00:02 ERROR Netty DNS resolution failed\r\n"
+        content += "\tat io.netty.resolver.dns.DnsNameResolver(DnsNameResolver.java:42)\r\n"
+        content += (1...10).map { "[INFO] noise \($0)" }.joined(separator: "\r\n") + "\r\n"
+        content += "2020-01-01 00:00:09 ERROR second failure\r\n"
+        try content.write(to: dir.appendingPathComponent("wr-gateway.log"), atomically: true, encoding: .utf8)
+
+        let runner = MockCommandRunner.simulating()
+        let workspace = Workspace(runner: runner)
+        await workspace.register(ServiceManager(
+            config: ForgeConfig(
+                name: "cloud-a", prefix: "wr",
+                services: [ServiceConfig(name: "gateway", port: 8080)]
+            ),
+            projectRoot: URL(fileURLWithPath: "/projects/cloud-a"),
+            runner: runner,
+            logsDirectory: dir
+        ))
+        let server = await ForgeMCPServer.makeServer(tools: ForgeTools(workspace: workspace))
+        let (clientTransport, serverTransport) = await InMemoryTransport.createConnectedPair()
+        try await server.start(transport: serverTransport)
+        let client = Client(name: "forge-tests", version: "1.0.0")
+        try await client.connect(transport: clientTransport)
+
+        // 1. pattern + context picks out just the error blocks, '--' between them.
+        let (filtered, err1) = try await client.callTool(
+            name: "get_logs",
+            arguments: ["service": "gateway", "pattern": "Exception|ERROR", "context": 3, "lines": 40])
+        #expect(err1 != true)
+        let t1 = text(filtered)
+        #expect(t1.contains("ERROR Netty DNS resolution failed"))
+        #expect(t1.contains("at io.netty.resolver.dns.DnsNameResolver")) // +1 context line
+        #expect(t1.contains("Started GatewayApplication")) // −1 context line
+        #expect(t1.contains("\n--\n")) // two disjoint blocks
+        #expect(!t1.contains("Scanning for projects")) // far from any match
+        #expect(!t1.contains("\u{1B}")) // ANSI stripped
+        #expect(!t1.contains("\r")) // CRLF never leaks into output
+
+        // 2. no matches → explicit message, not the whole file.
+        let (none, err2) = try await client.callTool(
+            name: "get_logs", arguments: ["service": "gateway", "pattern": "THIS_DOES_NOT_EXIST"])
+        #expect(err2 != true)
+        #expect(text(none) == "(no matching log lines)")
+
+        // 3. plain tail: exactly 40 lines + the truncation note.
+        let (tail, err3) = try await client.callTool(
+            name: "get_logs", arguments: ["service": "gateway", "lines": 40])
+        #expect(err3 != true)
+        let tailLines = text(tail).split(separator: "\n", omittingEmptySubsequences: false)
+        #expect(tailLines.count == 41) // note + 40 lines
+        #expect(tailLines.first?.hasPrefix("… (showing last 40 of 65 lines)") == true)
+        #expect(tailLines.last == "2020-01-01 00:00:09 ERROR second failure")
+
+        // 4. since with every entry older than the window → nothing.
+        let (old, err4) = try await client.callTool(
+            name: "get_logs", arguments: ["service": "gateway", "since": "5m"])
+        #expect(err4 != true)
+        #expect(text(old) == "(no matching log lines)")
+    }
+
     @Test("get_logs rejects an invalid regex with isError")
     func getLogsInvalidPattern() async throws {
         let client = try await connect(.simulating())

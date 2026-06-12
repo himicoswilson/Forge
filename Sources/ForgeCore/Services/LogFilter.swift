@@ -39,8 +39,13 @@ public enum LogFilter {
         limit: Int = 100,
         now: Date = Date()
     ) throws -> String {
+        // pipe-pane mirrors raw pty output, so real log files end lines with
+        // CRLF — and Swift treats "\r\n" as ONE Character (grapheme cluster),
+        // which `split(separator: "\n")` does not match. Split on
+        // `isNewline` instead: it covers "\r\n", "\n", and the lone "\r" of
+        // progress-bar rewrites, and keeps "\r" out of the output.
         var lines = stripANSI(text)
-            .split(separator: "\n", omittingEmptySubsequences: false)
+            .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
             .map(String.init)
         if lines.last?.isEmpty == true { lines.removeLast() }
 
