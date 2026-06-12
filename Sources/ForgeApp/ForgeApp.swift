@@ -36,7 +36,7 @@ struct ForgeApp: App {
 // MARK: - Menu bar icon
 
 private enum ForgeIcon {
-    static let image: NSImage = {
+    @MainActor static let image: NSImage = {
         if let url = Bundle.module.url(
             forResource: "StatusBarIcon", withExtension: "svg",
             subdirectory: "Assets.xcassets/StatusBarIcon.imageset"
