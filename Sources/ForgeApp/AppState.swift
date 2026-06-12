@@ -1,17 +1,34 @@
 import AppKit
 import SwiftUI
+import ServiceManagement
 import ForgeCore
 import ForgeMCP
+
+/// Display-only service status: only holds fields the menu actually renders.
+/// Strips volatile uptime/memory so equality is stable between polls.
+/// `logExists` is true when `~/.forge/logs/<prefix>-<service>.log` is on disk.
+struct DisplayStatus: Equatable, Sendable {
+    let service: ServiceConfig
+    let state: ServiceState
+    let logExists: Bool
+
+    init(_ full: ServiceStatus, sessionName: String, logsDirectory: URL) {
+        service = full.service
+        state = full.state
+        logExists = FileManager.default.fileExists(
+            atPath: logsDirectory.appendingPathComponent("\(sessionName).log").path
+        )
+    }
+}
 
 /// One project's point-in-time view for rendering.
 struct ProjectSnapshot: Identifiable, Equatable, Sendable {
     let name: String
     let jdk: String?
     let root: URL
-    let services: [ServiceStatus]
+    let services: [DisplayStatus]
 
     var id: String { name }
-    var upCount: Int { services.filter { $0.state == .up }.count }
 }
 
 struct ServiceKey: Hashable {
@@ -23,21 +40,34 @@ enum ServiceAction {
     case start, stop, restart, hotRestart
 }
 
-/// Owns the multi-project workspace, the MCP server, status polling and
-/// service actions. Views stay thin on top of this.
+/// Owns the multi-project workspace, the MCP server, status polling,
+/// service actions, and ignored-service persistence.
 @MainActor
 final class AppState: ObservableObject {
     @Published var snapshots: [ProjectSnapshot] = []
-    @Published var aggregate: AggregateState = .empty
-    @Published var busy: Set<ServiceKey> = []
-    @Published var statusLine = "Starting…"
+    @Published var busyAction: [ServiceKey: ServiceAction] = [:]
+    /// Non-nil once the MCP server is listening; nil while starting or if the port was unavailable.
+    @Published var mcpPort: Int? = nil
     @Published var lastError: String?
+    @Published var ignoredServices: Set<String> = []
+    @Published var serviceOrder: [String: [String]] = [:]
+    @Published var launchAtLogin: Bool = (SMAppService.mainApp.status == .enabled)
 
     private let workspace = Workspace()
     private var mcp: ForgeMCPServer?
     private var pollTask: Task<Void, Never>?
 
     static let pollInterval: Duration = .seconds(2)
+
+    private var ignoredURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".forge/ignored.json")
+    }
+
+    private var orderURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".forge/order.json")
+    }
 
     init() {
         Task { await bootstrap() }
@@ -49,9 +79,9 @@ final class AppState: ObservableObject {
 
     // MARK: - Lifecycle
 
-    /// Registered projects come from ~/.forge/projects.json; $FORGE_PROJECT
-    /// (if set) is added for this session without being persisted.
     private func bootstrap() async {
+        loadIgnored()
+        loadOrder()
         for root in ProjectRegistry.load() {
             _ = try? await workspace.addProject(root: root)
         }
@@ -61,13 +91,15 @@ final class AppState: ObservableObject {
         await refresh()
         startPolling()
 
+        let port = ProcessInfo.processInfo.environment["FORGE_MCP_PORT"]
+            .flatMap(Int.init) ?? ForgeMCPServer.defaultPort
         let server = ForgeMCPServer(tools: ForgeTools(workspace: workspace))
         do {
-            try await server.start()
+            try await server.start(port: port)
             mcp = server
-            statusLine = "MCP: http://127.0.0.1:\(ForgeMCPServer.defaultPort)\(ForgeMCPServer.endpoint)"
+            mcpPort = port
         } catch {
-            statusLine = "MCP failed to start: \(error.localizedDescription)"
+            lastError = "MCP failed to start on port \(port) — is another Forge instance running?"
         }
     }
 
@@ -83,7 +115,6 @@ final class AppState: ObservableObject {
 
     // MARK: - Status
 
-    /// Re-reads every service's status off the main thread.
     func refresh() async {
         let managers = await workspace.projects
         let snaps = await Task.detached(priority: .utility) {
@@ -92,20 +123,25 @@ final class AppState: ObservableObject {
                     name: manager.config.name,
                     jdk: manager.config.jdk,
                     root: manager.projectRoot,
-                    services: manager.statusAll()
+                    services: manager.statusAll().map { status in
+                        DisplayStatus(
+                            status,
+                            sessionName: manager.config.sessionName(for: status.service),
+                            logsDirectory: manager.logsDirectory
+                        )
+                    }
                 )
             }
         }.value
-        snapshots = snaps
-        aggregate = AggregateState.aggregate(snaps.flatMap(\.services))
+        if snaps != snapshots { snapshots = snaps }
     }
 
     // MARK: - Actions
 
     func perform(_ action: ServiceAction, project: String, service: ServiceConfig) {
         let key = ServiceKey(project: project, service: service.name)
-        guard !busy.contains(key) else { return }
-        busy.insert(key)
+        guard busyAction[key] == nil else { return }
+        busyAction[key] = action
         Task {
             if let manager = await workspace.project(named: project) {
                 let result = await Task.detached(priority: .userInitiated) {
@@ -122,17 +158,122 @@ final class AppState: ObservableObject {
                     lastError = "\(service.name): \(Self.describe(error))"
                 }
             }
-            busy.remove(key)
+            busyAction.removeValue(forKey: key)
             await refresh()
         }
     }
 
-    /// Last `lines` lines of the service's tmux pane (for the log drawer).
-    func logs(project: String, service: ServiceConfig, lines: Int = 200) async -> String {
-        guard let manager = await workspace.project(named: project) else { return "" }
-        return await Task.detached(priority: .utility) {
-            (try? manager.logs(of: service, lines: lines)) ?? "(no tmux session — service is not running)"
-        }.value
+    func startAll(project: String) {
+        for status in orderedServices(for: project)
+            where !isIgnored(project: project, service: status.service.name) && status.state == .down
+        {
+            perform(.start, project: project, service: status.service)
+        }
+    }
+
+    func stopAll(project: String) {
+        for status in orderedServices(for: project)
+            where !isIgnored(project: project, service: status.service.name) && status.state != .down
+        {
+            perform(.stop, project: project, service: status.service)
+        }
+    }
+
+    func copyMCPConfig() {
+        guard let port = mcpPort else { return }
+        let cmd = "claude mcp add --transport http forge http://127.0.0.1:\(port)/mcp"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(cmd, forType: .string)
+    }
+
+    func openLogs(project: String, service: ServiceConfig) {
+        Task {
+            guard let manager = await workspace.project(named: project) else { return }
+            let session = manager.config.sessionName(for: service)
+            let logURL = manager.logsDirectory.appendingPathComponent("\(session).log")
+            NSWorkspace.shared.open(logURL)
+        }
+    }
+
+    // MARK: - Ignore
+
+    func isIgnored(project: String, service: String) -> Bool {
+        ignoredServices.contains("\(project)/\(service)")
+    }
+
+    func toggleIgnore(project: String, service: String) {
+        let key = "\(project)/\(service)"
+        if ignoredServices.contains(key) {
+            ignoredServices.remove(key)
+        } else {
+            ignoredServices.insert(key)
+        }
+        saveIgnored()
+    }
+
+    private func loadIgnored() {
+        guard let data = try? Data(contentsOf: ignoredURL),
+              let list = try? JSONDecoder().decode([String].self, from: data)
+        else { return }
+        ignoredServices = Set(list)
+    }
+
+    private func saveIgnored() {
+        let list = ignoredServices.sorted()
+        guard let data = try? JSONEncoder().encode(list) else { return }
+        try? FileManager.default.createDirectory(
+            at: ignoredURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: ignoredURL, options: .atomic)
+    }
+
+    // MARK: - Ordering
+
+    /// All services for a project in the user's saved order; newly-discovered
+    /// services that have no saved position are appended at the end.
+    func orderedServices(for projectName: String) -> [DisplayStatus] {
+        guard let snap = snapshots.first(where: { $0.name == projectName }) else { return [] }
+        guard let order = serviceOrder[projectName], !order.isEmpty else { return snap.services }
+        let rank = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
+        return snap.services.sorted {
+            (rank[$0.service.name] ?? Int.max) < (rank[$1.service.name] ?? Int.max)
+        }
+    }
+
+    func moveService(in projectName: String, from indices: IndexSet, to offset: Int) {
+        var ordered = orderedServices(for: projectName)
+        ordered.move(fromOffsets: indices, toOffset: offset)
+        serviceOrder[projectName] = ordered.map(\.service.name)
+        saveOrder()
+    }
+
+    private func loadOrder() {
+        guard let data = try? Data(contentsOf: orderURL),
+              let dict = try? JSONDecoder().decode([String: [String]].self, from: data)
+        else { return }
+        serviceOrder = dict
+    }
+
+    private func saveOrder() {
+        guard let data = try? JSONEncoder().encode(serviceOrder) else { return }
+        try? FileManager.default.createDirectory(
+            at: orderURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: orderURL, options: .atomic)
+    }
+
+    // MARK: - Launch at Login
+
+    func setLaunchAtLogin(_ enable: Bool) {
+        do {
+            if enable { try SMAppService.mainApp.register() }
+            else       { try SMAppService.mainApp.unregister() }
+        } catch {
+            lastError = "Could not \(enable ? "enable" : "disable") launch at login: \(error.localizedDescription)"
+        }
+        launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 
     // MARK: - Projects
@@ -142,7 +283,7 @@ final class AppState: ObservableObject {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.message = "Choose a project root containing .forge/config.json"
+        panel.message = "Choose a Maven project root — services are auto-discovered (.forge/config.json optional)"
         guard panel.runModal() == .OK, let root = panel.url else { return }
 
         Task {
@@ -150,8 +291,8 @@ final class AppState: ObservableObject {
                 try await workspace.addProject(root: root)
                 try ProjectRegistry.save(await workspace.roots)
                 await refresh()
-            } catch ConfigError.notFound {
-                lastError = "No .forge/config.json in \(root.lastPathComponent)"
+            } catch ConfigError.noServices {
+                lastError = "No services found in \(root.lastPathComponent) — no Maven module declares a server.port and there is no .forge/config.json"
             } catch {
                 lastError = "Could not add project: \(error.localizedDescription)"
             }

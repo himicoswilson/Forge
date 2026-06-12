@@ -38,7 +38,11 @@ let package = Package(
             ]
         ),
         .target(name: "ForgeTestSupport", dependencies: ["ForgeCore"]),
-        .executableTarget(name: "ForgeApp", dependencies: ["ForgeCore", "ForgeMCP"]),
+        .executableTarget(
+            name: "ForgeApp",
+            dependencies: ["ForgeCore", "ForgeMCP"],
+            resources: [.process("Resources")]
+        ),
         .testTarget(name: "ForgeCoreTests", dependencies: ["ForgeCore", "ForgeTestSupport"]),
         .testTarget(name: "ForgeMCPTests", dependencies: ["ForgeMCP", "ForgeTestSupport"]),
     ]

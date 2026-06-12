@@ -1,30 +1,59 @@
 import Foundation
 
+private final class ConcurrentBox<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data: [Int: T] = [:]
+    func set(_ value: T, at i: Int) { lock.lock(); defer { lock.unlock() }; data[i] = value }
+    func collect(count: Int) -> [T] { (0..<count).compactMap { data[$0] } }
+}
+
 /// Orchestrates all shell operations for one project: status, lifecycle,
 /// hot restart, and log capture. Pure composition over `CommandRunning`,
 /// so every behaviour is unit-testable without touching the system.
 public struct ServiceManager: Sendable {
     public let config: ForgeConfig
     public let projectRoot: URL
+    /// Where pipe-pane mirrors each session's full output (`<session>.log`).
+    public let logsDirectory: URL
     let ports: PortChecker
     let tmux: TmuxController
+    let health: HealthChecker
     let runner: any CommandRunning
 
-    public init(config: ForgeConfig, projectRoot: URL, runner: any CommandRunning = ProcessCommandRunner()) {
+    public static var defaultLogsDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".forge/logs")
+    }
+
+    public init(
+        config: ForgeConfig,
+        projectRoot: URL,
+        runner: any CommandRunning = ProcessCommandRunner(),
+        logsDirectory: URL? = nil
+    ) {
         self.config = config
         self.projectRoot = projectRoot
         self.runner = runner
+        self.logsDirectory = logsDirectory ?? Self.defaultLogsDirectory
         self.ports = PortChecker(runner: runner)
         self.tmux = TmuxController(runner: runner)
+        self.health = HealthChecker(runner: runner)
     }
 
     // MARK: - Status
 
+    /// A bound port means "up" only once actuator agrees: Spring Cloud
+    /// services answer on their port well before they finish initializing,
+    /// so port-bound + health not UP reports `.starting` (with pid info).
     public func status(of service: ServiceConfig) -> ServiceStatus {
         let pids = ports.pids(onPort: service.port)
         if let pid = pids.first {
             let info = ports.processInfo(pid: pid)
-            return ServiceStatus(service: service, state: .up, pid: pid, memoryKB: info?.memoryKB, uptime: info?.uptime)
+            let state: ServiceState
+            switch health.check(port: service.port) {
+            case .ready, .noActuator: state = .up
+            case .notReady: state = .starting
+            }
+            return ServiceStatus(service: service, state: state, pid: pid, memoryKB: info?.memoryKB, uptime: info?.uptime)
         }
         if tmux.hasSession(config.sessionName(for: service)) {
             return ServiceStatus(service: service, state: .starting)
@@ -32,8 +61,16 @@ public struct ServiceManager: Sendable {
         return ServiceStatus(service: service, state: .down)
     }
 
-    public func statusAll() -> [ServiceStatus] {
-        config.services.map(status(of:))
+    /// Returns status for every service not in `excluding`, checked in parallel.
+    /// Results are returned in config order.
+    public func statusAll(excluding: Set<String> = []) -> [ServiceStatus] {
+        let services = config.services.filter { !excluding.contains($0.name) }
+        guard !services.isEmpty else { return [] }
+        let box = ConcurrentBox<ServiceStatus>()
+        DispatchQueue.concurrentPerform(iterations: services.count) { i in
+            box.set(status(of: services[i]), at: i)
+        }
+        return box.collect(count: services.count)
     }
 
     // MARK: - JDK
@@ -53,25 +90,51 @@ public struct ServiceManager: Sendable {
     // MARK: - Lifecycle
 
     /// Launches the service in a new detached tmux session. The start command
-    /// is owned by Forge — no per-project scripts:
-    /// `[JAVA_HOME=…] mvn spring-boot:run -pl <module> -am` at the project root.
+    /// is owned by Forge — no per-project scripts — and runs in two phases:
+    ///
+    /// `mvn install -pl <module> -am -DskipTests && mvn org.springframework.boot:spring-boot-maven-plugin:run -pl <module>`
+    ///
+    /// A single `mvn spring-boot:run -pl <module> -am` cannot work on typical
+    /// multi-module projects: the `spring-boot` prefix only resolves in poms
+    /// that declare the plugin (the leaf modules, not the aggregator root),
+    /// and a direct goal with `-am` would execute `run` on every reactor
+    /// module — libraries included. So: build deps via a lifecycle phase,
+    /// then run only the target module with the fully qualified goal.
+    /// The `env` prefix (not `VAR=… cmd`) keeps it valid under fish,
+    /// which tmux may use as the session shell.
     public func start(_ service: ServiceConfig) throws {
-        var command = "mvn spring-boot:run -pl \(config.module(for: service)) -am"
-        if let home = javaHome() {
-            command = "JAVA_HOME=\"\(home)\" " + command
-        }
+        let session = config.sessionName(for: service)
+        try? FileManager.default.removeItem(
+            at: logsDirectory.appendingPathComponent("\(session).log")
+        )
+        let module = config.module(for: service)
+        let env = javaHome().map { "env JAVA_HOME=\"\($0)\" " } ?? ""
+        let command = "\(env)mvn install -pl \(module) -am -DskipTests"
+            + " && \(env)mvn org.springframework.boot:spring-boot-maven-plugin:run -pl \(module)"
         try tmux.newSession(
-            name: config.sessionName(for: service),
+            name: session,
             command: command,
             workingDirectory: projectRoot
         )
+        // Mirror the session's output to a durable log file — capture-pane
+        // only holds the bounded pane history. Best effort: a missing log
+        // must never block a start.
+        try? FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+        try? tmux.pipePane(session: session, toFile: logsDirectory.appendingPathComponent("\(session).log").path)
     }
 
-    /// Kills the service's tmux session. No-op if the session does not exist.
+    /// Kills the service's tmux session, then SIGTERMs whatever still holds
+    /// the port. The JVM is normally a child of the session and dies with
+    /// it, but a service can outlive its pane (or be started outside tmux) —
+    /// SIGTERM lets Spring run its shutdown hooks either way.
     public func stop(_ service: ServiceConfig) throws {
         let session = config.sessionName(for: service)
-        guard tmux.hasSession(session) else { return }
-        try tmux.killSession(session)
+        if tmux.hasSession(session) {
+            try tmux.killSession(session)
+        }
+        for pid in ports.pids(onPort: service.port) {
+            _ = try? runner.run("kill", ["-15", "\(pid)"])
+        }
     }
 
     public func restart(_ service: ServiceConfig) throws {
@@ -95,30 +158,43 @@ public struct ServiceManager: Sendable {
         }
     }
 
+    // MARK: - Wait for startup
+
+    /// Blocks until the service reaches `.up`, its process exits without binding
+    /// the port (build failure), or `timeoutSeconds` elapses.
+    ///
+    /// - Parameter pollInterval: How often to re-check status. Injectable so
+    ///   tests can use a small value without real waits.
+    public func waitForUp(
+        _ service: ServiceConfig,
+        timeoutSeconds: Int = 300,
+        pollInterval: TimeInterval = 2
+    ) throws {
+        let deadline = Date().addingTimeInterval(Double(timeoutSeconds))
+        while Date() < deadline {
+            switch status(of: service).state {
+            case .up:
+                return
+            case .down:
+                throw CommandError.failed(
+                    command: "mvn run \(config.module(for: service))",
+                    exitCode: 1,
+                    stderr: "Process exited before becoming ready — check logs."
+                )
+            case .starting:
+                Thread.sleep(forTimeInterval: pollInterval)
+            }
+        }
+        throw CommandError.failed(
+            command: "start \(service.name)",
+            exitCode: 1,
+            stderr: "Timed out after \(timeoutSeconds)s waiting for the service to become UP."
+        )
+    }
+
     // MARK: - Logs
 
     public func logs(of service: ServiceConfig, lines: Int = 100) throws -> String {
         try tmux.capturePane(session: config.sessionName(for: service), lines: lines)
-    }
-
-    // MARK: - Warmup
-
-    /// Core services every module depends on, per SPEC's `warmup` tool.
-    public static let coreServiceNames = ["gateway", "auth", "tenant"]
-
-    /// Starts gateway + auth + tenant plus the named module, skipping
-    /// anything already up or starting. Returns the services it started.
-    @discardableResult
-    public func warmup(module: String) throws -> [ServiceConfig] {
-        var targets = Self.coreServiceNames.compactMap(config.service(named:))
-        if let moduleService = config.service(named: module), !targets.contains(moduleService) {
-            targets.append(moduleService)
-        }
-        var started: [ServiceConfig] = []
-        for service in targets where status(of: service).state == .down {
-            try start(service)
-            started.append(service)
-        }
-        return started
     }
 }

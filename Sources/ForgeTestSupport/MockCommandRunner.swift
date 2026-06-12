@@ -46,31 +46,97 @@ public final class MockCommandRunner: CommandRunning, @unchecked Sendable {
     }
 }
 
+// MARK: - Simulation factory
+
 extension MockCommandRunner {
     /// Simulates a machine where the given ports are listening (port → pid)
     /// and the given tmux sessions exist. `ps` reports a fixed rss/etime.
     /// `javaHome` is what `/usr/libexec/java_home` answers (nil = no JDK found).
+    /// Listening ports answer `/actuator/health` with UP unless listed in
+    /// `unhealthyPorts` (still booting → 503 DOWN).
+    ///
+    /// The returned runner is **stateful**: `tmux new-session` adds the session
+    /// name to the live set and `tmux kill-session` removes it, so subsequent
+    /// `has-session` calls reflect mutations made during a test.
     public static func simulating(
         listeningPorts: [Int: Int32] = [:],
         sessions: Set<String> = [],
-        javaHome: String? = nil
+        javaHome: String? = nil,
+        unhealthyPorts: Set<Int> = []
     ) -> MockCommandRunner {
-        MockCommandRunner { call in
+        let state = SimulationState(sessions: sessions, ports: listeningPorts)
+
+        return MockCommandRunner { call in
             switch call.executable {
+
             case "lsof":
                 let port = Int(call.arguments[0].replacingOccurrences(of: "-ti:", with: ""))!
-                guard let pid = listeningPorts[port] else { return CommandResult(exitCode: 1) }
+                guard let pid = state.pid(onPort: port) else { return CommandResult(exitCode: 1) }
                 return CommandResult(exitCode: 0, stdout: "\(pid)\n")
+
             case "ps":
                 return CommandResult(exitCode: 0, stdout: "129024 01:23:45\n")
+
+            case "tmux" where call.arguments.first == "new-session":
+                // ["new-session", "-d", "-s", <name>, "-c", <dir>, <cmd>]
+                if let idx = call.arguments.firstIndex(of: "-s"), idx + 1 < call.arguments.count {
+                    state.addSession(call.arguments[idx + 1])
+                }
+                return CommandResult(exitCode: 0)
+
+            case "tmux" where call.arguments.first == "kill-session":
+                // ["kill-session", "-t", <name>]
+                if call.arguments.count >= 3 { state.removeSession(call.arguments[2]) }
+                return CommandResult(exitCode: 0)
+
             case "tmux" where call.arguments.first == "has-session":
-                return CommandResult(exitCode: sessions.contains(call.arguments[2]) ? 0 : 1)
+                // ["has-session", "-t", <name>]
+                return CommandResult(exitCode: state.hasSession(call.arguments[2]) ? 0 : 1)
+
             case "/usr/libexec/java_home":
                 guard let javaHome else { return CommandResult(exitCode: 1, stderr: "Unable to find any JVMs") }
                 return CommandResult(exitCode: 0, stdout: javaHome + "\n")
+
+            case "/usr/bin/curl":
+                guard let url = call.arguments.last,
+                      let port = Int(url.split(separator: ":").last?.split(separator: "/").first ?? "") else {
+                    return CommandResult(exitCode: 1)
+                }
+                return unhealthyPorts.contains(port)
+                    ? CommandResult(exitCode: 0, stdout: "{\"status\":\"DOWN\"}\n503")
+                    : CommandResult(exitCode: 0, stdout: "{\"status\":\"UP\"}\n200")
+
             default:
                 return CommandResult(exitCode: 0)
             }
         }
+    }
+}
+
+// MARK: - Internal mutable state for simulating()
+
+/// Holds live session and port state for `MockCommandRunner.simulating`.
+/// Thread-safe: all mutations go through NSLock.
+private final class SimulationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sessions: Set<String>
+    private var ports: [Int: Int32]
+
+    init(sessions: Set<String>, ports: [Int: Int32]) {
+        self.sessions = sessions
+        self.ports = ports
+    }
+
+    func hasSession(_ name: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }; return sessions.contains(name)
+    }
+    func addSession(_ name: String) {
+        lock.lock(); defer { lock.unlock() }; sessions.insert(name)
+    }
+    func removeSession(_ name: String) {
+        lock.lock(); defer { lock.unlock() }; sessions.remove(name)
+    }
+    func pid(onPort port: Int) -> Int32? {
+        lock.lock(); defer { lock.unlock() }; return ports[port]
     }
 }

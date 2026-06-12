@@ -16,14 +16,16 @@ public struct ServiceConfig: Sendable, Codable, Equatable, Hashable, Identifiabl
     }
 }
 
-/// Per-project configuration, read from `<projectRoot>/.forge/config.json`.
+/// Per-project configuration: services auto-discovered from the Maven
+/// module tree (see `ServiceDiscovery`), optionally overridden by
+/// `<projectRoot>/.forge/config.json`.
 ///
-/// Only `services` is required — the minimal config is:
-/// ```json
-/// { "services": [ { "name": "gateway", "port": 8080 } ] }
-/// ```
-/// Defaults: `name` ← project folder name, `prefix` ← `name`,
-/// `jdk` ← contents of `.java-version` in the project root (if present).
+/// The config file is not required at all when discovery finds the
+/// services. When present, every field is optional: entries in `services`
+/// override a discovered service of the same name (or add one discovery
+/// can't see), and `name`/`prefix`/`jdk` replace the derived defaults
+/// (`name` ← project folder name, `prefix` ← shared artifactId prefix,
+/// `jdk` ← `.java-version` contents).
 public struct ForgeConfig: Sendable, Equatable {
     public let name: String
     public let prefix: String
@@ -42,33 +44,52 @@ public struct ForgeConfig: Sendable, Equatable {
     public static let relativePath = ".forge/config.json"
     public static let javaVersionFile = ".java-version"
 
-    /// All fields except `services` are optional in the JSON.
+    /// Every field is optional in the JSON.
     private struct Raw: Decodable {
         let name: String?
         let prefix: String?
         let jdk: String?
-        let services: [ServiceConfig]
+        let services: [ServiceConfig]?
     }
 
     public static func load(projectRoot: URL) throws -> ForgeConfig {
         let url = projectRoot.appendingPathComponent(relativePath)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            throw ConfigError.notFound(url.path)
-        }
-        let data = try Data(contentsOf: url)
-        let raw: Raw
-        do {
-            raw = try JSONDecoder().decode(Raw.self, from: data)
-        } catch {
-            throw ConfigError.invalid(url.path, underlying: "\(error)")
+        var raw: Raw?
+        if FileManager.default.fileExists(atPath: url.path) {
+            let data = try Data(contentsOf: url)
+            do {
+                raw = try JSONDecoder().decode(Raw.self, from: data)
+            } catch {
+                throw ConfigError.invalid(url.path, underlying: "\(error)")
+            }
         }
 
-        let name = raw.name ?? projectRoot.lastPathComponent
+        let discovery = ServiceDiscovery.discover(projectRoot: projectRoot)
+        var services = discovery.services
+        for override in raw?.services ?? [] {
+            // Same name or same port = the same service (a port identifies a
+            // service); the config entry wins, keeping the discovered module
+            // unless it overrides that too.
+            if let index = services.firstIndex(where: { $0.name == override.name || $0.port == override.port }) {
+                services[index] = ServiceConfig(
+                    name: override.name,
+                    port: override.port,
+                    module: override.module ?? services[index].module
+                )
+            } else {
+                services.append(override)
+            }
+        }
+        guard !services.isEmpty else {
+            throw ConfigError.noServices(projectRoot.path)
+        }
+
+        let name = raw?.name ?? projectRoot.lastPathComponent
         return ForgeConfig(
             name: name,
-            prefix: raw.prefix ?? name,
-            jdk: raw.jdk ?? javaVersion(projectRoot: projectRoot),
-            services: raw.services
+            prefix: raw?.prefix ?? discovery.prefix ?? name,
+            jdk: raw?.jdk ?? javaVersion(projectRoot: projectRoot),
+            services: services
         )
     }
 
@@ -96,6 +117,7 @@ public struct ForgeConfig: Sendable, Equatable {
 }
 
 public enum ConfigError: Error, Equatable {
-    case notFound(String)
+    /// Neither Maven discovery nor `.forge/config.json` produced a single service.
+    case noServices(String)
     case invalid(String, underlying: String)
 }

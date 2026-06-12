@@ -33,6 +33,15 @@ public struct TmuxController: Sendable {
         }
     }
 
+    /// Mirrors all future pane output to a file (`pipe-pane -o 'cat >> …'`).
+    /// `-o` keeps the call idempotent: it only opens a pipe when none exists.
+    public func pipePane(session: String, toFile path: String) throws {
+        let result = try runner.run("tmux", ["pipe-pane", "-t", session, "-o", "cat >> '\(path)'"])
+        guard result.succeeded else {
+            throw CommandError.failed(command: "tmux pipe-pane", exitCode: result.exitCode, stderr: result.stderr)
+        }
+    }
+
     /// Last `lines` lines of the session's pane (`capture-pane -p -S -<lines>`).
     public func capturePane(session: String, lines: Int) throws -> String {
         let result = try runner.run("tmux", ["capture-pane", "-p", "-t", session, "-S", "-\(lines)"])

@@ -95,10 +95,10 @@ struct ForgeConfigTests {
         #expect(config.jdk == "17")
     }
 
-    @Test("missing config file throws notFound")
+    @Test("no config file and nothing to discover throws noServices")
     func missingFileThrows() {
         let root = URL(fileURLWithPath: "/nonexistent-\(UUID().uuidString)")
-        #expect(throws: ConfigError.notFound(root.appendingPathComponent(ForgeConfig.relativePath).path)) {
+        #expect(throws: ConfigError.noServices(root.path)) {
             try ForgeConfig.load(projectRoot: root)
         }
     }
@@ -111,6 +111,77 @@ struct ForgeConfigTests {
         #expect(throws: ConfigError.self) {
             try ForgeConfig.load(projectRoot: root)
         }
+    }
+
+    /// Drops a minimal one-module Maven tree into the root so discovery
+    /// finds `<artifactId>` listening on `port`.
+    private func addMavenModule(root: URL, artifactId: String, port: Int) throws {
+        try """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <project xmlns="http://maven.apache.org/POM/4.0.0">
+          <artifactId>parent</artifactId>
+          <modules>
+            <module>\(artifactId)</module>
+          </modules>
+        </project>
+        """.write(to: root.appendingPathComponent("pom.xml"), atomically: true, encoding: .utf8)
+
+        let moduleDir = root.appendingPathComponent(artifactId)
+        try FileManager.default.createDirectory(
+            at: moduleDir.appendingPathComponent("src/main/resources"),
+            withIntermediateDirectories: true
+        )
+        try """
+        <project xmlns="http://maven.apache.org/POM/4.0.0"><artifactId>\(artifactId)</artifactId></project>
+        """.write(to: moduleDir.appendingPathComponent("pom.xml"), atomically: true, encoding: .utf8)
+        try "server:\n  port: \(port)\n".write(
+            to: moduleDir.appendingPathComponent("src/main/resources/application.yml"),
+            atomically: true, encoding: .utf8
+        )
+    }
+
+    @Test("no config file at all: services come from Maven discovery")
+    func discoveryWithoutConfig() throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try addMavenModule(root: root, artifactId: "demo-gateway", port: 8080)
+
+        let config = try ForgeConfig.load(projectRoot: root)
+        #expect(config.name == "demo-project")
+        #expect(config.prefix == "demo")
+        #expect(config.services == [ServiceConfig(name: "gateway", port: 8080, module: "demo-gateway")])
+    }
+
+    @Test("config entry on the same port renames the discovered service instead of duplicating it")
+    func configRenamesByPort() throws {
+        let root = try makeRoot(config: """
+        { "services": [ { "name": "wrong-gateway", "port": 8080 } ] }
+        """)
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try addMavenModule(root: root, artifactId: "demo-gateway", port: 8080)
+
+        let config = try ForgeConfig.load(projectRoot: root)
+        #expect(config.services == [ServiceConfig(name: "wrong-gateway", port: 8080, module: "demo-gateway")])
+    }
+
+    @Test("config overrides a discovered service's port and adds extra services")
+    func configOverridesDiscovery() throws {
+        let root = try makeRoot(config: """
+        {
+          "services": [
+            { "name": "gateway", "port": 18080 },
+            { "name": "job", "port": 9203, "module": "xxl-job-admin" }
+          ]
+        }
+        """)
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try addMavenModule(root: root, artifactId: "demo-gateway", port: 8080)
+
+        let config = try ForgeConfig.load(projectRoot: root)
+        #expect(config.services == [
+            ServiceConfig(name: "gateway", port: 18080, module: "demo-gateway"),
+            ServiceConfig(name: "job", port: 9203, module: "xxl-job-admin"),
+        ])
     }
 
     @Test("module defaults to prefix-name and respects explicit override")

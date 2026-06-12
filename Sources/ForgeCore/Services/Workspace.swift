@@ -17,7 +17,8 @@ public actor Workspace {
         self.runner = runner
     }
 
-    /// Loads `<root>/.forge/config.json` and registers the project.
+    /// Discovers the project's services (Maven tree + optional
+    /// `.forge/config.json` overrides) and registers it.
     /// Re-adding the same root replaces the previous registration (reload).
     @discardableResult
     public func addProject(root: URL) throws -> ServiceManager {

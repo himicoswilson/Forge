@@ -21,7 +21,8 @@ struct ForgeMCPTests {
                 ]
             ),
             projectRoot: URL(fileURLWithPath: "/projects/cloud-a"),
-            runner: runner
+            runner: runner,
+            logsDirectory: URL(fileURLWithPath: "/logs")
         )
     }
 
@@ -36,7 +37,8 @@ struct ForgeMCPTests {
                 ]
             ),
             projectRoot: URL(fileURLWithPath: "/projects/cloud-b"),
-            runner: runner
+            runner: runner,
+            logsDirectory: URL(fileURLWithPath: "/logs")
         )
     }
 
@@ -61,14 +63,14 @@ struct ForgeMCPTests {
         return ""
     }
 
-    @Test("tools/list exposes all 8 Forge tools")
+    @Test("tools/list exposes all 7 Forge tools")
     func toolCatalog() async throws {
         let client = try await connect(.simulating())
         let (tools, _) = try await client.listTools()
         #expect(tools.map(\.name) == [
             "list_services", "get_service", "get_logs",
             "start_service", "stop_service", "restart_service",
-            "hotrestart_service", "warmup",
+            "hotrestart_service",
         ])
         #expect(tools.allSatisfy { $0.description?.isEmpty == false })
     }
@@ -157,27 +159,31 @@ struct ForgeMCPTests {
 
     @Test("start_service launches the built-in mvn command in tmux")
     func startService() async throws {
-        let runner = MockCommandRunner.simulating()
+        // Port 9700 already "bound" so waitForUp sees UP on the first poll.
+        let runner = MockCommandRunner.simulating(listeningPorts: [9700: 1234])
         let client = try await connect(runner)
-        let (content, isError) = try await client.callTool(name: "start_service", arguments: ["service": "train"])
+        let (content, isError) = try await client.callTool(name: "start_service", arguments: ["services": ["train"]])
         #expect(isError != true)
-        #expect(text(content).contains("Started cloud-a/train"))
+        #expect(text(content).contains("Started cloud-a/train — UP on port 9700"))
         #expect(runner.calls.contains { $0.executable == "tmux" && $0.arguments == [
             "new-session", "-d", "-s", "wr-train", "-c", "/projects/cloud-a",
-            "mvn spring-boot:run -pl wr-train -am",
+            "mvn install -pl wr-train -am -DskipTests"
+                + " && mvn org.springframework.boot:spring-boot-maven-plugin:run -pl wr-train",
         ] })
     }
 
     @Test("start_service uses the project's JDK when configured")
     func startServiceWithJDK() async throws {
-        let runner = MockCommandRunner.simulating(javaHome: "/jdk21")
+        // Port 19000 (billing) already "bound" so waitForUp returns immediately.
+        let runner = MockCommandRunner.simulating(listeningPorts: [19000: 1234], javaHome: "/jdk21")
         let client = try await connect(runner)
-        let (_, isError) = try await client.callTool(name: "start_service", arguments: ["service": "billing"])
+        let (_, isError) = try await client.callTool(name: "start_service", arguments: ["services": ["billing"]])
         #expect(isError != true)
         #expect(runner.commandLines.contains("/usr/libexec/java_home -v 21"))
         #expect(runner.calls.contains { $0.executable == "tmux" && $0.arguments == [
             "new-session", "-d", "-s", "nb-billing", "-c", "/projects/cloud-b",
-            "JAVA_HOME=\"/jdk21\" mvn spring-boot:run -pl nb-billing -am",
+            "env JAVA_HOME=\"/jdk21\" mvn install -pl nb-billing -am -DskipTests"
+                + " && env JAVA_HOME=\"/jdk21\" mvn org.springframework.boot:spring-boot-maven-plugin:run -pl nb-billing",
         ] })
     }
 
@@ -185,7 +191,7 @@ struct ForgeMCPTests {
     func stopStoppedService() async throws {
         let runner = MockCommandRunner.simulating()
         let client = try await connect(runner)
-        let (content, isError) = try await client.callTool(name: "stop_service", arguments: ["service": "train"])
+        let (content, isError) = try await client.callTool(name: "stop_service", arguments: ["services": ["train"]])
         #expect(isError != true)
         #expect(text(content).contains("not running"))
         #expect(!runner.commandLines.contains { $0.contains("kill-session") })
@@ -195,7 +201,7 @@ struct ForgeMCPTests {
     func stopRunningService() async throws {
         let runner = MockCommandRunner.simulating(listeningPorts: [9201: 22], sessions: ["wr-auth"])
         let client = try await connect(runner)
-        let (content, isError) = try await client.callTool(name: "stop_service", arguments: ["service": "auth"])
+        let (content, isError) = try await client.callTool(name: "stop_service", arguments: ["services": ["auth"]])
         #expect(isError != true)
         #expect(text(content).contains("Stopped cloud-a/auth"))
         #expect(runner.commandLines.contains("tmux kill-session -t wr-auth"))
@@ -205,7 +211,7 @@ struct ForgeMCPTests {
     func hotRestart() async throws {
         let runner = MockCommandRunner.simulating()
         let client = try await connect(runner)
-        let (content, isError) = try await client.callTool(name: "hotrestart_service", arguments: ["service": "train"])
+        let (content, isError) = try await client.callTool(name: "hotrestart_service", arguments: ["services": ["train"]])
         #expect(isError != true)
         #expect(text(content).contains("wr-train"))
         #expect(runner.commandLines.contains("mvn compile -pl wr-train -am -DskipTests -q"))
@@ -219,22 +225,9 @@ struct ForgeMCPTests {
                 : CommandResult(exitCode: 1)
         }
         let client = try await connect(runner)
-        let (content, isError) = try await client.callTool(name: "hotrestart_service", arguments: ["service": "train"])
+        let (content, isError) = try await client.callTool(name: "hotrestart_service", arguments: ["services": ["train"]])
         #expect(isError == true)
         #expect(text(content).contains("COMPILATION ERROR"))
-    }
-
-    @Test("warmup starts core services + module that are down")
-    func warmup() async throws {
-        let runner = MockCommandRunner.simulating(listeningPorts: [8080: 1], sessions: ["wr-auth"])
-        let client = try await connect(runner)
-        let (content, isError) = try await client.callTool(name: "warmup", arguments: ["module": "train"])
-        #expect(isError != true)
-        #expect(text(content).contains("tenant, train"))
-        let launched = runner.calls
-            .filter { $0.executable == "tmux" && $0.arguments.first == "new-session" }
-            .map { $0.arguments[3] }
-        #expect(launched == ["wr-tenant", "wr-train"])
     }
 
     @Test("empty workspace explains how to register a project")

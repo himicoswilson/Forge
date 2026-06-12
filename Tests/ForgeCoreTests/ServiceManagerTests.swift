@@ -24,8 +24,13 @@ struct ServiceManagerTests {
         .simulating(listeningPorts: listeningPorts, sessions: sessions)
     }
 
-    private func manager(_ runner: MockCommandRunner) -> ServiceManager {
-        ServiceManager(config: config, projectRoot: root, runner: runner)
+    private func manager(_ runner: MockCommandRunner, config: ForgeConfig? = nil) -> ServiceManager {
+        ServiceManager(
+            config: config ?? self.config,
+            projectRoot: root,
+            runner: runner,
+            logsDirectory: URL(fileURLWithPath: "/logs")
+        )
     }
 
     // MARK: - Status
@@ -44,6 +49,17 @@ struct ServiceManagerTests {
     func statusStarting() {
         let mgr = manager(world(sessions: ["wr-train"]))
         #expect(mgr.status(of: config.service(named: "train")!).state == .starting)
+    }
+
+    @Test("port bound but actuator not UP yet → starting, with pid info")
+    func statusStartingWhileUnhealthy() {
+        let runner = MockCommandRunner.simulating(listeningPorts: [9201: 4242], unhealthyPorts: [9201])
+        let status = manager(runner).status(of: config.service(named: "auth")!)
+        #expect(status.state == .starting)
+        #expect(status.pid == 4242)
+        #expect(status.memoryKB == 129024)
+        #expect(runner.commandLines.contains(
+            "/usr/bin/curl -s -m 1 -w \n%{http_code} http://127.0.0.1:9201/actuator/health"))
     }
 
     @Test("no port, no session → down")
@@ -65,13 +81,28 @@ struct ServiceManagerTests {
 
     // MARK: - Lifecycle
 
-    @Test("start launches mvn spring-boot:run in a detached session at project root")
+    /// The `new-session` invocation among all recorded calls.
+    private func newSession(in runner: MockCommandRunner) -> MockCommandRunner.Call? {
+        runner.calls.first { $0.executable == "tmux" && $0.arguments.first == "new-session" }
+    }
+
+    @Test("start builds deps then runs the module via the fully qualified goal, in a detached session at project root")
     func start() throws {
         let runner = world()
         try manager(runner).start(config.service(named: "train")!)
-        #expect(runner.calls.last?.arguments == [
+        #expect(newSession(in: runner)?.arguments == [
             "new-session", "-d", "-s", "wr-train", "-c", "/proj",
-            "mvn spring-boot:run -pl wr-train -am",
+            "mvn install -pl wr-train -am -DskipTests"
+                + " && mvn org.springframework.boot:spring-boot-maven-plugin:run -pl wr-train",
+        ])
+    }
+
+    @Test("start pipes the session's output to a durable log file")
+    func startPipesLogs() throws {
+        let runner = world()
+        try manager(runner).start(config.service(named: "train")!)
+        #expect(runner.calls.last?.arguments == [
+            "pipe-pane", "-t", "wr-train", "-o", "cat >> '/logs/wr-train.log'",
         ])
     }
 
@@ -79,38 +110,51 @@ struct ServiceManagerTests {
     func startWithJDK() throws {
         let jdkConfig = ForgeConfig(name: "normal-cloud", prefix: "wr", jdk: "17", services: config.services)
         let runner = MockCommandRunner.simulating(javaHome: "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home")
-        let mgr = ServiceManager(config: jdkConfig, projectRoot: root, runner: runner)
+        let mgr = manager(runner, config: jdkConfig)
 
         try mgr.start(jdkConfig.service(named: "train")!)
 
         #expect(runner.commandLines.first == "/usr/libexec/java_home -v 17")
-        #expect(runner.calls.last?.arguments.last ==
-            "JAVA_HOME=\"/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home\" mvn spring-boot:run -pl wr-train -am")
+        let home = "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home"
+        #expect(newSession(in: runner)?.arguments.last ==
+            "env JAVA_HOME=\"\(home)\" mvn install -pl wr-train -am -DskipTests"
+                + " && env JAVA_HOME=\"\(home)\" mvn org.springframework.boot:spring-boot-maven-plugin:run -pl wr-train")
     }
 
     @Test("start falls back to PATH's java when the JDK version is not installed")
     func startWithMissingJDK() throws {
         let jdkConfig = ForgeConfig(name: "normal-cloud", prefix: "wr", jdk: "99", services: config.services)
         let runner = MockCommandRunner.simulating(javaHome: nil)
-        let mgr = ServiceManager(config: jdkConfig, projectRoot: root, runner: runner)
+        let mgr = manager(runner, config: jdkConfig)
 
         try mgr.start(jdkConfig.service(named: "train")!)
 
-        #expect(runner.calls.last?.arguments.last == "mvn spring-boot:run -pl wr-train -am")
+        #expect(newSession(in: runner)?.arguments.last ==
+            "mvn install -pl wr-train -am -DskipTests"
+                + " && mvn org.springframework.boot:spring-boot-maven-plugin:run -pl wr-train")
     }
 
     @Test("stop kills an existing session")
     func stop() throws {
         let runner = world(sessions: ["wr-auth"])
         try manager(runner).stop(config.service(named: "auth")!)
-        #expect(runner.commandLines.last == "tmux kill-session -t wr-auth")
+        #expect(runner.commandLines.contains("tmux kill-session -t wr-auth"))
     }
 
-    @Test("stop is a no-op when no session exists")
+    @Test("stop SIGTERMs a JVM that outlived its session")
+    func stopOrphanedService() throws {
+        let runner = world(listeningPorts: [9201: 4242])
+        try manager(runner).stop(config.service(named: "auth")!)
+        #expect(!runner.commandLines.contains { $0.contains("kill-session") })
+        #expect(runner.commandLines.contains("kill -15 4242"))
+    }
+
+    @Test("stop is a no-op when nothing is running")
     func stopWithoutSession() throws {
         let runner = world()
         try manager(runner).stop(config.service(named: "auth")!)
         #expect(!runner.commandLines.contains { $0.contains("kill-session") })
+        #expect(!runner.calls.contains { $0.executable == "kill" })
     }
 
     @Test("restart = kill existing session, then fresh start")
@@ -118,7 +162,7 @@ struct ServiceManagerTests {
         let runner = world(sessions: ["wr-gateway"])
         try manager(runner).restart(config.service(named: "gateway")!)
         let tmuxOps = runner.calls.filter { $0.executable == "tmux" }.map { $0.arguments[0] }
-        #expect(tmuxOps == ["has-session", "kill-session", "new-session"])
+        #expect(tmuxOps == ["has-session", "kill-session", "new-session", "pipe-pane"])
     }
 
     // MARK: - Hot restart
@@ -156,6 +200,58 @@ struct ServiceManagerTests {
         }
     }
 
+    // MARK: - waitForUp
+
+    @Test("waitForUp returns immediately when service is already up")
+    func waitForUpAlreadyUp() throws {
+        let runner = world(listeningPorts: [9201: 4242])
+        try manager(runner).waitForUp(config.service(named: "auth")!, pollInterval: 0.01)
+    }
+
+    @Test("waitForUp throws immediately when service is down (session gone, build failed)")
+    func waitForUpBuildFailure() {
+        let runner = world() // no session, no port
+        #expect(throws: CommandError.self) {
+            try manager(runner).waitForUp(config.service(named: "auth")!, pollInterval: 0.01)
+        }
+    }
+
+    @Test("waitForUp times out and throws when service stays starting")
+    func waitForUpTimeout() {
+        let runner = world(sessions: ["wr-auth"]) // session alive but port never binds
+        #expect(throws: CommandError.self) {
+            try manager(runner).waitForUp(
+                config.service(named: "auth")!,
+                timeoutSeconds: 0,
+                pollInterval: 0.01
+            )
+        }
+    }
+
+    @Test("waitForUp polls until port appears then returns")
+    func waitForUpEventuallyUp() throws {
+        var calls = 0
+        let runner = MockCommandRunner { call in
+            switch call.executable {
+            case "lsof":
+                calls += 1
+                // Port only "appears" after the 3rd lsof call
+                guard calls >= 3 else { return CommandResult(exitCode: 1) }
+                return CommandResult(exitCode: 0, stdout: "4242\n")
+            case "ps":
+                return CommandResult(exitCode: 0, stdout: "129024 01:23:45\n")
+            case "tmux" where call.arguments.first == "has-session":
+                return CommandResult(exitCode: 0) // session always alive while starting
+            case "/usr/bin/curl":
+                return CommandResult(exitCode: 0, stdout: "{\"status\":\"UP\"}\n200")
+            default:
+                return CommandResult(exitCode: 0)
+            }
+        }
+        try manager(runner).waitForUp(config.service(named: "auth")!, pollInterval: 0.01)
+        #expect(calls >= 3)
+    }
+
     // MARK: - Logs
 
     @Test("logs tails the service's tmux pane, default 100 lines")
@@ -166,19 +262,5 @@ struct ServiceManagerTests {
         let output = try manager(runner).logs(of: config.service(named: "auth")!)
         #expect(output == "log line\n")
         #expect(runner.commandLines == ["tmux capture-pane -p -t wr-auth -S -100"])
-    }
-
-    // MARK: - Warmup
-
-    @Test("warmup starts only the core services and module that are down")
-    func warmup() throws {
-        // gateway already up, auth mid-start; tenant and train are down.
-        let runner = world(listeningPorts: [8080: 1], sessions: ["wr-auth"])
-        let started = try manager(runner).warmup(module: "train")
-        #expect(started.map(\.name) == ["tenant", "train"])
-        let launched = runner.calls
-            .filter { $0.executable == "tmux" && $0.arguments.first == "new-session" }
-            .map { $0.arguments[3] }
-        #expect(launched == ["wr-tenant", "wr-train"])
     }
 }

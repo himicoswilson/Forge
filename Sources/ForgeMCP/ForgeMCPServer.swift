@@ -12,8 +12,7 @@ public actor ForgeMCPServer {
     public static let serverVersion = "0.2.0"
 
     private let tools: ForgeTools
-    private var server: Server?
-    private var transport: StatelessHTTPServerTransport?
+    private var router: RequestRouter?
     private var listener: MCPHTTPListener?
 
     public init(tools: ForgeTools) {
@@ -41,17 +40,15 @@ public actor ForgeMCPServer {
     public func start(host: String = "127.0.0.1", port: Int = ForgeMCPServer.defaultPort) async throws {
         guard listener == nil else { return }
 
-        let transport = StatelessHTTPServerTransport()
-        let server = await Self.makeServer(tools: tools)
-        try await server.start(transport: transport)
+        let router = RequestRouter(tools: tools)
+        try await router.reset()
 
         let listener = MCPHTTPListener(host: host, port: port, endpoint: Self.endpoint) { request in
-            await transport.handleRequest(request)
+            await router.handle(request)
         }
         try await listener.start()
 
-        self.server = server
-        self.transport = transport
+        self.router = router
         self.listener = listener
     }
 
@@ -62,10 +59,62 @@ public actor ForgeMCPServer {
 
     public func stop() async {
         await listener?.stop()
+        await router?.teardown()
+        listener = nil
+        router = nil
+    }
+}
+
+// MARK: - Request router
+
+/// Manages the Server+Transport pair, creating a fresh pair whenever an
+/// `initialize` request arrives. This avoids the SDK's "Server is already
+/// initialized" rejection when a client reconnects (e.g. Claude Code restart).
+///
+/// Swift actor reentrancy ensures concurrent tool calls are not blocked:
+/// while `handleRequest` is suspended waiting for a slow tool, other requests
+/// can proceed.
+private actor RequestRouter {
+    private let tools: ForgeTools
+    private var server: Server?
+    private var transport: StatelessHTTPServerTransport?
+
+    init(tools: ForgeTools) {
+        self.tools = tools
+    }
+
+    /// Creates a fresh Server+Transport pair, stopping any previous one first.
+    func reset() async throws {
         await server?.stop()
         await transport?.disconnect()
-        listener = nil
+        let t = StatelessHTTPServerTransport()
+        let s = await ForgeMCPServer.makeServer(tools: tools)
+        try await s.start(transport: t)
+        server = s
+        transport = t
+    }
+
+    func handle(_ request: HTTPRequest) async -> HTTPResponse {
+        if isInitializeRequest(request) {
+            try? await reset()
+        }
+        guard let transport else {
+            return .error(statusCode: 503, .internalError("MCP server not ready"))
+        }
+        return await transport.handleRequest(request)
+    }
+
+    func teardown() async {
+        await server?.stop()
+        await transport?.disconnect()
         server = nil
         transport = nil
+    }
+
+    private func isInitializeRequest(_ request: HTTPRequest) -> Bool {
+        guard let body = request.body,
+              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+        else { return false }
+        return (json["method"] as? String) == "initialize"
     }
 }
