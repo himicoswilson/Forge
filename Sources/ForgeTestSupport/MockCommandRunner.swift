@@ -74,10 +74,26 @@ extension MockCommandRunner {
         return MockCommandRunner { call in
             switch call.executable {
 
+            case "lsof" where call.arguments.first == "-nP":
+                // ["-nP", "-iTCP:8080,9201", "-sTCP:LISTEN", "-Fpn"]
+                let ports = call.arguments[1].dropFirst("-iTCP:".count)
+                    .split(separator: ",").compactMap { Int($0) }
+                let bound = ports.compactMap { port in state.pid(onPort: port).map { (port: port, pid: $0) } }
+                guard !bound.isEmpty else { return CommandResult(exitCode: 1) }
+                // The f<fd> line mimics real -F output; parsers must skip it.
+                let out = bound.map { "p\($0.pid)\nf23\nn*:\($0.port)" }.joined(separator: "\n") + "\n"
+                return CommandResult(exitCode: 0, stdout: out)
+
             case "lsof":
                 let port = Int(call.arguments[0].replacingOccurrences(of: "-ti:", with: ""))!
                 guard let pid = state.pid(onPort: port) else { return CommandResult(exitCode: 1) }
                 return CommandResult(exitCode: 0, stdout: "\(pid)\n")
+
+            case "ps" where call.arguments.contains("pid=,rss=,etime="):
+                // ["-o", "pid=,rss=,etime=", "-p", "11,22"]
+                let pids = (call.arguments.last ?? "").split(separator: ",")
+                let out = pids.map { "\($0) 129024 01:23:45" }.joined(separator: "\n") + "\n"
+                return CommandResult(exitCode: 0, stdout: out)
 
             case "ps":
                 return CommandResult(exitCode: 0, stdout: "129024 01:23:45\n")
@@ -97,6 +113,22 @@ extension MockCommandRunner {
             case "tmux" where call.arguments.first == "has-session":
                 // ["has-session", "-t", <name>]
                 return CommandResult(exitCode: state.hasSession(call.arguments[2]) ? 0 : 1)
+
+            case "tmux" where call.arguments.first == "list-sessions":
+                // ["list-sessions", "-F", "#{session_name}\t#{session_created}"]
+                let all = state.allSessions()
+                guard !all.isEmpty else { return CommandResult(exitCode: 1, stderr: "no server running") }
+                let out = all.map { "\($0.name)\t\(Int($0.created.timeIntervalSince1970))" }
+                    .joined(separator: "\n") + "\n"
+                return CommandResult(exitCode: 0, stdout: out)
+
+            case "tmux" where call.arguments.first == "list-panes" && call.arguments.contains("-a"):
+                // ["list-panes", "-a", "-F", "#{session_name}\t#{pane_dead}"]
+                let all = state.allSessions()
+                guard !all.isEmpty else { return CommandResult(exitCode: 1, stderr: "no server running") }
+                let out = all.map { "\($0.name)\t\(state.isDead($0.name) ? "1" : "0")" }
+                    .joined(separator: "\n") + "\n"
+                return CommandResult(exitCode: 0, stdout: out)
 
             case "tmux" where call.arguments.first == "list-panes":
                 // ["list-panes", "-t", <name>, "-F", "#{pane_dead}"]
@@ -154,6 +186,12 @@ private final class SimulationState: @unchecked Sendable {
 
     func hasSession(_ name: String) -> Bool {
         lock.lock(); defer { lock.unlock() }; return sessions.contains(name)
+    }
+    /// Every live session with its creation date, sorted by name for
+    /// deterministic batched list-sessions/list-panes output.
+    func allSessions() -> [(name: String, created: Date)] {
+        lock.lock(); defer { lock.unlock() }
+        return sessions.sorted().map { ($0, createdAt[$0] ?? Date()) }
     }
     func isDead(_ name: String) -> Bool {
         lock.lock(); defer { lock.unlock() }; return dead.contains(name)
