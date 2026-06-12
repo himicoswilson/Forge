@@ -81,4 +81,51 @@ struct TmuxControllerTests {
         #expect(runner.commandLines == ["tmux kill-session -t wr-auth"])
     }
 
+    // MARK: - Batched queries
+
+    @Test("listSessions parses every session's creation epoch in one call")
+    func listSessions() {
+        let runner = MockCommandRunner { _ in
+            CommandResult(exitCode: 0, stdout: "wr-auth\t1750000000\nwr-train\t1750000042\n")
+        }
+        let sessions = TmuxController(runner: runner).listSessions()
+        #expect(sessions == [
+            "wr-auth": Date(timeIntervalSince1970: 1_750_000_000),
+            "wr-train": Date(timeIntervalSince1970: 1_750_000_042),
+        ])
+        #expect(runner.commandLines == ["tmux list-sessions -F #{session_name}\t#{session_created}"])
+    }
+
+    @Test("listSessions is empty when no tmux server is running")
+    func listSessionsNoServer() {
+        let runner = MockCommandRunner { _ in
+            CommandResult(exitCode: 1, stderr: "no server running on /private/tmp/tmux-501/default")
+        }
+        #expect(TmuxController(runner: runner).listSessions().isEmpty)
+    }
+
+    @Test("deadPanes reports every session's first pane in one call")
+    func deadPanes() {
+        let runner = MockCommandRunner { _ in
+            CommandResult(exitCode: 0, stdout: "wr-auth\t0\nwr-train\t1\n")
+        }
+        let dead = TmuxController(runner: runner).deadPanes()
+        #expect(dead == ["wr-auth": false, "wr-train": true])
+        #expect(runner.commandLines == ["tmux list-panes -a -F #{session_name}\t#{pane_dead}"])
+    }
+
+    @Test("deadPanes only counts the first pane per session, like isPaneDead")
+    func deadPanesFirstPaneWins() {
+        let runner = MockCommandRunner { _ in
+            CommandResult(exitCode: 0, stdout: "wr-auth\t0\nwr-auth\t1\n")
+        }
+        #expect(TmuxController(runner: runner).deadPanes() == ["wr-auth": false])
+    }
+
+    @Test("deadPanes is empty when no tmux server is running")
+    func deadPanesNoServer() {
+        let runner = MockCommandRunner { _ in CommandResult(exitCode: 1) }
+        #expect(TmuxController(runner: runner).deadPanes().isEmpty)
+    }
+
 }
