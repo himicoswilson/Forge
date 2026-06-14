@@ -8,46 +8,45 @@ struct HealthCheckerTests {
 
     @Test("queries actuator health over localhost with a 1s budget")
     func argv() {
-        let runner = MockCommandRunner { _ in
-            CommandResult(exitCode: 0, stdout: "{\"status\":\"UP\"}\n200")
+        nonisolated(unsafe) var seen: (url: URL, timeout: TimeInterval)?
+        let checker = HealthChecker { url, timeout in
+            seen = (url, timeout)
+            return (statusCode: 200, body: #"{"status":"UP"}"#)
         }
-        let result = HealthChecker(runner: runner).check(port: 9201)
-        #expect(result == .ready)
-        #expect(runner.calls.last?.executable == "/usr/bin/curl")
-        #expect(runner.calls.last?.arguments == [
-            "-s", "-m", "1", "-w", "\n%{http_code}", "http://127.0.0.1:9201/actuator/health",
-        ])
+        #expect(checker.check(port: 9201) == .ready)
+        #expect(seen?.url.absoluteString == "http://127.0.0.1:9201/actuator/health")
+        #expect(seen?.timeout == 1)
     }
 
     @Test("200 with status UP → ready, tolerating JSON whitespace")
     func ready() {
-        #expect(HealthChecker.interpret("{\"status\":\"UP\",\"groups\":[\"liveness\"]}\n200") == .ready)
-        #expect(HealthChecker.interpret("{ \"status\" : \"UP\" }\n200") == .ready)
+        #expect(HealthChecker.interpret(statusCode: 200, body: #"{"status":"UP","groups":["liveness"]}"#) == .ready)
+        #expect(HealthChecker.interpret(statusCode: 200, body: #"{ "status" : "UP" }"#) == .ready)
     }
 
     @Test("503 with status DOWN → notReady")
     func down() {
-        #expect(HealthChecker.interpret("{\"status\":\"DOWN\"}\n503") == .notReady)
+        #expect(HealthChecker.interpret(statusCode: 503, body: #"{"status":"DOWN"}"#) == .notReady)
     }
 
     @Test("200 without an UP status → notReady")
     func unexpectedBody() {
-        #expect(HealthChecker.interpret("{\"status\":\"OUT_OF_SERVICE\"}\n200") == .notReady)
+        #expect(HealthChecker.interpret(statusCode: 200, body: #"{"status":"OUT_OF_SERVICE"}"#) == .notReady)
     }
 
     @Test("404 → noActuator (service simply has no actuator endpoint)")
     func noActuator() {
-        #expect(HealthChecker.interpret("{\"timestamp\":\"…\",\"error\":\"Not Found\"}\n404") == .noActuator)
+        #expect(HealthChecker.interpret(statusCode: 404, body: #"{"error":"Not Found"}"#) == .noActuator)
     }
 
-    @Test("curl failure (timeout, connection reset) → notReady")
-    func curlFailure() {
-        let runner = MockCommandRunner { _ in CommandResult(exitCode: 28) }
-        #expect(HealthChecker(runner: runner).check(port: 9201) == .notReady)
+    @Test("transport failure (timeout, connection reset) → notReady")
+    func transportFailure() {
+        let checker = HealthChecker { _, _ in nil }
+        #expect(checker.check(port: 9201) == .notReady)
     }
 
-    @Test("empty output → notReady")
-    func emptyOutput() {
-        #expect(HealthChecker.interpret("") == .notReady)
+    @Test("empty 200 body → notReady")
+    func emptyBody() {
+        #expect(HealthChecker.interpret(statusCode: 200, body: "") == .notReady)
     }
 }

@@ -37,16 +37,6 @@ public struct TmuxController: Sendable {
         return result.stdout.split(whereSeparator: \.isNewline).first == "1"
     }
 
-    /// When the session was created (`#{session_created}`, a unix epoch).
-    public func sessionCreated(_ name: String) -> Date? {
-        guard let result = try? runner.run("tmux", ["display-message", "-p", "-t", name, "#{session_created}"]),
-              result.succeeded,
-              let epoch = TimeInterval(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-            return nil
-        }
-        return Date(timeIntervalSince1970: epoch)
-    }
-
     public func killSession(_ name: String) throws {
         let result = try runner.run("tmux", ["kill-session", "-t", name])
         guard result.succeeded else {

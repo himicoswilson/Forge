@@ -119,18 +119,25 @@ public enum LogFilter {
         return regex
     }
 
+    /// Compiled once: `timestamp(of:)` runs for every line of a log, and a
+    /// regex literal constructs a fresh `Regex` each time it is evaluated.
+    /// `Regex` is immutable after construction — it just lacks a `Sendable`
+    /// annotation — so sharing these is safe.
+    nonisolated(unsafe) private static let dateTimeStamp = /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/
+    nonisolated(unsafe) private static let timeOnlyStamp = /(\d{2}):(\d{2}):(\d{2})/
+
     /// Timestamp at the start of a log line: Spring Boot's default
     /// "2026-06-12 15:04:05" (or T-separated) and time-only logback
     /// patterns like "15:04:05.123" (assumed today; a stamp later than
     /// `now` means it crossed midnight, so it counts as yesterday).
     static func timestamp(of line: String, now: Date, calendar: Calendar = .current) -> Date? {
-        if let m = try? /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.prefixMatch(in: line) {
+        if let m = try? dateTimeStamp.prefixMatch(in: line) {
             var c = DateComponents()
             c.year = Int(m.1); c.month = Int(m.2); c.day = Int(m.3)
             c.hour = Int(m.4); c.minute = Int(m.5); c.second = Int(m.6)
             return calendar.date(from: c)
         }
-        if let m = try? /(\d{2}):(\d{2}):(\d{2})/.prefixMatch(in: line) {
+        if let m = try? timeOnlyStamp.prefixMatch(in: line) {
             var c = calendar.dateComponents([.year, .month, .day], from: now)
             c.hour = Int(m.1); c.minute = Int(m.2); c.second = Int(m.3)
             guard let date = calendar.date(from: c) else { return nil }
@@ -141,9 +148,11 @@ public enum LogFilter {
         return nil
     }
 
+    nonisolated(unsafe) private static let csiSequence = /\u{1B}\[[0-9;?]*[A-Za-z]/
+
     /// pipe-pane mirrors raw terminal output, colour codes included — drop
     /// CSI escape sequences so regexes and timestamp detection see clean text.
     static func stripANSI(_ text: String) -> String {
-        text.replacing(/\u{1B}\[[0-9;?]*[A-Za-z]/, with: "")
+        text.replacing(csiSequence, with: "")
     }
 }

@@ -52,8 +52,7 @@ extension MockCommandRunner {
     /// Simulates a machine where the given ports are listening (port → pid)
     /// and the given tmux sessions exist. `ps` reports a fixed rss/etime.
     /// `javaHome` is what `/usr/libexec/java_home` answers (nil = no JDK found).
-    /// Listening ports answer `/actuator/health` with UP unless listed in
-    /// `unhealthyPorts` (still booting → 503 DOWN).
+    /// Health checks run in-process — stub them with `HealthChecker.simulating`.
     ///
     /// The returned runner is **stateful**: `tmux new-session` adds the session
     /// name to the live set and `tmux kill-session` removes it, so subsequent
@@ -66,8 +65,7 @@ extension MockCommandRunner {
         listeningPorts: [Int: Int32] = [:],
         sessions: Set<String> = [],
         deadSessions: Set<String> = [],
-        javaHome: String? = nil,
-        unhealthyPorts: Set<Int> = []
+        javaHome: String? = nil
     ) -> MockCommandRunner {
         let state = SimulationState(sessions: sessions.union(deadSessions), dead: deadSessions, ports: listeningPorts)
 
@@ -137,25 +135,9 @@ extension MockCommandRunner {
                 }
                 return CommandResult(exitCode: 0, stdout: state.isDead(call.arguments[2]) ? "1\n" : "0\n")
 
-            case "tmux" where call.arguments.first == "display-message":
-                // ["display-message", "-p", "-t", <name>, "#{session_created}"]
-                guard let created = state.created(call.arguments[3]) else {
-                    return CommandResult(exitCode: 1, stderr: "can't find session")
-                }
-                return CommandResult(exitCode: 0, stdout: "\(Int(created.timeIntervalSince1970))\n")
-
             case "/usr/libexec/java_home":
                 guard let javaHome else { return CommandResult(exitCode: 1, stderr: "Unable to find any JVMs") }
                 return CommandResult(exitCode: 0, stdout: javaHome + "\n")
-
-            case "/usr/bin/curl":
-                guard let url = call.arguments.last,
-                      let port = Int(url.split(separator: ":").last?.split(separator: "/").first ?? "") else {
-                    return CommandResult(exitCode: 1)
-                }
-                return unhealthyPorts.contains(port)
-                    ? CommandResult(exitCode: 0, stdout: "{\"status\":\"DOWN\"}\n503")
-                    : CommandResult(exitCode: 0, stdout: "{\"status\":\"UP\"}\n200")
 
             default:
                 return CommandResult(exitCode: 0)
@@ -195,9 +177,6 @@ private final class SimulationState: @unchecked Sendable {
     }
     func isDead(_ name: String) -> Bool {
         lock.lock(); defer { lock.unlock() }; return dead.contains(name)
-    }
-    func created(_ name: String) -> Date? {
-        lock.lock(); defer { lock.unlock() }; return createdAt[name]
     }
     func addSession(_ name: String) {
         lock.lock(); defer { lock.unlock() }

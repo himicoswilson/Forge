@@ -22,7 +22,8 @@ struct ForgeMCPTests {
             ),
             projectRoot: URL(fileURLWithPath: "/projects/cloud-a"),
             runner: runner,
-            logsDirectory: URL(fileURLWithPath: "/logs")
+            logsDirectory: URL(fileURLWithPath: "/logs"),
+            health: .simulating()
         )
     }
 
@@ -38,7 +39,8 @@ struct ForgeMCPTests {
             ),
             projectRoot: URL(fileURLWithPath: "/projects/cloud-b"),
             runner: runner,
-            logsDirectory: URL(fileURLWithPath: "/logs")
+            logsDirectory: URL(fileURLWithPath: "/logs"),
+            health: .simulating()
         )
     }
 
@@ -257,25 +259,26 @@ struct ForgeMCPTests {
     @Test("start_service launches the built-in mvn command in tmux and waits until UP")
     func startService() async throws {
         // Stateful world: port 9700 only "binds" after new-session ran, so
-        // the tool really exercises start → poll → UP.
-        var started = false
+        // the tool really exercises start → poll → UP. Status uses the
+        // batched query shapes (one lsof for all ports, list-sessions/-panes).
+        nonisolated(unsafe) var started = false
         let runner = MockCommandRunner { call in
             switch call.executable {
             case "tmux" where call.arguments.first == "new-session":
                 started = true
                 return CommandResult(exitCode: 0)
-            case "tmux" where call.arguments.first == "has-session":
-                return CommandResult(exitCode: started ? 0 : 1)
+            case "tmux" where call.arguments.first == "list-sessions":
+                guard started else { return CommandResult(exitCode: 1, stderr: "no server running") }
+                return CommandResult(exitCode: 0, stdout: "wr-train\t1750000000\n")
             case "tmux" where call.arguments.first == "list-panes":
-                return CommandResult(exitCode: 0, stdout: "0\n")
-            case "lsof" where call.arguments == ["-ti:9700"]:
-                return started ? CommandResult(exitCode: 0, stdout: "1234\n") : CommandResult(exitCode: 1)
+                return CommandResult(exitCode: 0, stdout: "wr-train\t0\n")
             case "lsof":
-                return CommandResult(exitCode: 1)
+                // Batched LISTEN query; port 9700 binds only after start.
+                return started
+                    ? CommandResult(exitCode: 0, stdout: "p1234\nn*:9700\n")
+                    : CommandResult(exitCode: 1)
             case "ps":
-                return CommandResult(exitCode: 0, stdout: "129024 00:00:03\n")
-            case "/usr/bin/curl":
-                return CommandResult(exitCode: 0, stdout: "{\"status\":\"UP\"}\n200")
+                return CommandResult(exitCode: 0, stdout: "1234 129024 00:00:03\n")
             default:
                 return CommandResult(exitCode: 0)
             }

@@ -6,18 +6,17 @@ import ForgeMCP
 
 /// Display-only service status: only holds fields the menu actually renders.
 /// Strips volatile uptime/memory so equality is stable between polls.
-/// `logExists` is true when `~/.forge/logs/<prefix>-<service>.log` is on disk.
+/// `logExists` is true when `~/.forge/logs/<prefix>-<service>.log` is on disk
+/// — checked against one directory listing per refresh, not a stat per service.
 struct DisplayStatus: Equatable, Sendable {
     let service: ServiceConfig
     let state: ServiceState
     let logExists: Bool
 
-    init(_ full: ServiceStatus, sessionName: String, logsDirectory: URL) {
+    init(_ full: ServiceStatus, logExists: Bool) {
         service = full.service
         state = full.state
-        logExists = FileManager.default.fileExists(
-            atPath: logsDirectory.appendingPathComponent("\(sessionName).log").path
-        )
+        self.logExists = logExists
     }
 }
 
@@ -118,16 +117,20 @@ final class AppState: ObservableObject {
     func refresh() async {
         let managers = await workspace.projects
         let snaps = await Task.detached(priority: .utility) {
-            managers.map { manager in
-                ProjectSnapshot(
+            // One system interrogation shared across all projects per tick.
+            let statuses = ServiceManager.statusAll(of: managers)
+            return zip(managers, statuses).map { manager, sts in
+                let logNames = Set(
+                    (try? FileManager.default.contentsOfDirectory(atPath: manager.logsDirectory.path)) ?? []
+                )
+                return ProjectSnapshot(
                     name: manager.config.name,
                     jdk: manager.config.jdk,
                     root: manager.projectRoot,
-                    services: manager.statusAll().map { status in
+                    services: sts.map { status in
                         DisplayStatus(
                             status,
-                            sessionName: manager.config.sessionName(for: status.service),
-                            logsDirectory: manager.logsDirectory
+                            logExists: logNames.contains("\(manager.config.sessionName(for: status.service)).log")
                         )
                     }
                 )

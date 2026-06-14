@@ -24,12 +24,13 @@ struct ServiceManagerTests {
         .simulating(listeningPorts: listeningPorts, sessions: sessions)
     }
 
-    private func manager(_ runner: MockCommandRunner, config: ForgeConfig? = nil) -> ServiceManager {
+    private func manager(_ runner: MockCommandRunner, config: ForgeConfig? = nil, health: HealthChecker = .simulating()) -> ServiceManager {
         ServiceManager(
             config: config ?? self.config,
             projectRoot: root,
             runner: runner,
-            logsDirectory: URL(fileURLWithPath: "/logs")
+            logsDirectory: URL(fileURLWithPath: "/logs"),
+            health: health
         )
     }
 
@@ -56,15 +57,14 @@ struct ServiceManagerTests {
 
     @Test("port bound but actuator not UP yet → starting, with pid info")
     func statusStartingWhileUnhealthy() {
-        let runner = MockCommandRunner.simulating(listeningPorts: [9201: 4242], unhealthyPorts: [9201])
-        let status = manager(runner).status(of: config.service(named: "auth")!)
+        let runner = MockCommandRunner.simulating(listeningPorts: [9201: 4242])
+        let status = manager(runner, health: .simulating(unhealthyPorts: [9201]))
+            .status(of: config.service(named: "auth")!)
         #expect(status.state == .starting)
         #expect(status.pid == 4242)
         #expect(status.memoryKB == 129024)
         // No tmux session to date the start from → falls back to process uptime.
         #expect(status.startingFor == "01:23:45")
-        #expect(runner.commandLines.contains(
-            "/usr/bin/curl -s -m 1 -w \n%{http_code} http://127.0.0.1:9201/actuator/health"))
     }
 
     @Test("session whose pane died (remain-on-exit) → down, not starting")
@@ -116,8 +116,8 @@ struct ServiceManagerTests {
 
     @Test("statusAll: port bound but actuator not UP → starting, startingFor falls back to process uptime")
     func statusAllStartingWhileUnhealthy() {
-        let runner = MockCommandRunner.simulating(listeningPorts: [9201: 4242], unhealthyPorts: [9201])
-        let all = manager(runner).statusAll()
+        let runner = MockCommandRunner.simulating(listeningPorts: [9201: 4242])
+        let all = manager(runner, health: .simulating(unhealthyPorts: [9201])).statusAll()
         let auth = all.first { $0.service.name == "auth" }!
         #expect(auth.state == .starting)
         #expect(auth.pid == 4242)
@@ -128,10 +128,9 @@ struct ServiceManagerTests {
 
     @Test("statusAll: unhealthy port with a live session dates startingFor from the session")
     func statusAllUnhealthyWithSession() {
-        let runner = MockCommandRunner.simulating(
-            listeningPorts: [9201: 4242], sessions: ["wr-auth"], unhealthyPorts: [9201]
-        )
-        let auth = manager(runner).statusAll().first { $0.service.name == "auth" }!
+        let runner = MockCommandRunner.simulating(listeningPorts: [9201: 4242], sessions: ["wr-auth"])
+        let auth = manager(runner, health: .simulating(unhealthyPorts: [9201]))
+            .statusAll().first { $0.service.name == "auth" }!
         #expect(auth.state == .starting)
         #expect(auth.startingFor?.hasPrefix("00:4") == true)
     }
@@ -149,12 +148,12 @@ struct ServiceManagerTests {
         #expect(all.map(\.state) == [.up, .up, .down, .starting])
 
         // 4 services, 2 bound ports, 1 session:
-        // 1 lsof + 1 ps + 1 list-sessions + 1 list-panes + 2 health curls.
+        // 1 lsof + 1 ps + 1 list-sessions + 1 list-panes. Health checks run
+        // in-process, so they spawn nothing.
         let byExecutable = Dictionary(grouping: runner.calls, by: \.executable)
         #expect(byExecutable["lsof"]?.count == 1)
         #expect(byExecutable["ps"]?.count == 1)
         #expect(byExecutable["tmux"]?.count == 2)
-        #expect(byExecutable["/usr/bin/curl"]?.count == 2)
         // The per-service forms must be gone from this path entirely.
         #expect(!runner.commandLines.contains { $0.contains("-ti:") })
         #expect(!runner.commandLines.contains { $0.contains("has-session") })
@@ -178,6 +177,47 @@ struct ServiceManagerTests {
         let runner = world()
         _ = manager(runner).statusAll(excluding: ["gateway", "train"])
         #expect(runner.commandLines.first == "lsof -nP -iTCP:9201,9400 -sTCP:LISTEN -Fpn")
+    }
+
+    @Test("status(of:) shares the batched state machine — the per-service query forms are gone")
+    func statusSingleUsesBatchedQueries() {
+        let runner = world(listeningPorts: [9201: 4242])
+        _ = manager(runner).status(of: config.service(named: "auth")!)
+        #expect(runner.commandLines.first == "lsof -nP -iTCP:9201 -sTCP:LISTEN -Fpn")
+        #expect(!runner.commandLines.contains { $0.contains("-ti:") })
+        #expect(!runner.commandLines.contains { $0.contains("has-session") })
+        #expect(!runner.commandLines.contains { $0.contains("display-message") })
+    }
+
+    @Test("statusAll(of:) interrogates the system once for the whole workspace, not per project")
+    func statusAllCrossProject() {
+        let runner = MockCommandRunner.simulating(
+            listeningPorts: [8080: 1, 19000: 2], sessions: ["nb-billing"]
+        )
+        let projectA = manager(runner)
+        let projectB = ServiceManager(
+            config: ForgeConfig(
+                name: "cloud-b", prefix: "nb",
+                services: [ServiceConfig(name: "billing", port: 19000)]
+            ),
+            projectRoot: URL(fileURLWithPath: "/projB"),
+            runner: runner,
+            logsDirectory: URL(fileURLWithPath: "/logs"),
+            health: .simulating()
+        )
+
+        let all = ServiceManager.statusAll(of: [projectA, projectB])
+
+        #expect(all.count == 2)
+        #expect(all[0].map(\.state) == [.up, .down, .down, .down])
+        #expect(all[1].map(\.state) == [.up])
+        // One lsof for the union of both projects' ports, one tmux pair —
+        // not one capture per project.
+        #expect(runner.commandLines.first == "lsof -nP -iTCP:8080,9201,9400,9700,19000 -sTCP:LISTEN -Fpn")
+        let byExecutable = Dictionary(grouping: runner.calls, by: \.executable)
+        #expect(byExecutable["lsof"]?.count == 1)
+        #expect(byExecutable["ps"]?.count == 1)
+        #expect(byExecutable["tmux"]?.count == 2)
     }
 
     @Test("elapsedString formats like ps etime")
@@ -400,11 +440,14 @@ struct ServiceManagerTests {
                 calls += 1
                 // Port only "appears" after the 3rd lsof call
                 guard calls >= 3 else { return CommandResult(exitCode: 1) }
-                return CommandResult(exitCode: 0, stdout: "4242\n")
+                return CommandResult(exitCode: 0, stdout: "p4242\nn*:9201\n")
             case "ps":
-                return CommandResult(exitCode: 0, stdout: "129024 01:23:45\n")
-            case "tmux" where call.arguments.first == "has-session":
-                return CommandResult(exitCode: 0) // session always alive while starting
+                return CommandResult(exitCode: 0, stdout: "4242 129024 01:23:45\n")
+            case "tmux" where call.arguments.first == "list-sessions":
+                // session always alive while starting
+                return CommandResult(exitCode: 0, stdout: "wr-auth\t1750000000\n")
+            case "tmux" where call.arguments.first == "list-panes":
+                return CommandResult(exitCode: 0, stdout: "wr-auth\t0\n")
             case "/usr/bin/curl":
                 return CommandResult(exitCode: 0, stdout: "{\"status\":\"UP\"}\n200")
             default:

@@ -28,7 +28,8 @@ public struct ServiceManager: Sendable {
         config: ForgeConfig,
         projectRoot: URL,
         runner: any CommandRunning = ProcessCommandRunner(),
-        logsDirectory: URL? = nil
+        logsDirectory: URL? = nil,
+        health: HealthChecker = HealthChecker()
     ) {
         self.config = config
         self.projectRoot = projectRoot
@@ -36,7 +37,7 @@ public struct ServiceManager: Sendable {
         self.logsDirectory = logsDirectory ?? Self.defaultLogsDirectory
         self.ports = PortChecker(runner: runner)
         self.tmux = TmuxController(runner: runner)
-        self.health = HealthChecker(runner: runner)
+        self.health = health
     }
 
     // MARK: - Status
@@ -44,37 +45,12 @@ public struct ServiceManager: Sendable {
     /// A bound port means "up" only once actuator agrees: Spring Cloud
     /// services answer on their port well before they finish initializing,
     /// so port-bound + health not UP reports `.starting` (with pid info).
+    ///
+    /// One state machine for every caller: this captures a one-port system
+    /// snapshot and reads it, so the single-service and `statusAll` paths
+    /// can never drift apart (they used to be two hand-kept copies).
     public func status(of service: ServiceConfig) -> ServiceStatus {
-        let session = config.sessionName(for: service)
-        let pids = ports.pids(onPort: service.port)
-        if let pid = pids.first {
-            let info = ports.processInfo(pid: pid)
-            switch health.check(port: service.port) {
-            case .ready, .noActuator:
-                return ServiceStatus(service: service, state: .up, pid: pid, memoryKB: info?.memoryKB, uptime: info?.uptime)
-            case .notReady:
-                return ServiceStatus(
-                    service: service, state: .starting, pid: pid,
-                    memoryKB: info?.memoryKB, uptime: info?.uptime,
-                    startingFor: startingDuration(session: session) ?? info?.uptime
-                )
-            }
-        }
-        if tmux.hasSession(session) {
-            // remain-on-exit can keep the session alive after its process
-            // died — that's down (start failed/exited), not starting.
-            if tmux.isPaneDead(session) {
-                return ServiceStatus(service: service, state: .down)
-            }
-            return ServiceStatus(service: service, state: .starting, startingFor: startingDuration(session: session))
-        }
-        return ServiceStatus(service: service, state: .down)
-    }
-
-    /// Elapsed time since the session was created, formatted like `ps` etime
-    /// ("00:42" / "01:23:45"). nil when the session doesn't exist.
-    private func startingDuration(session: String) -> String? {
-        tmux.sessionCreated(session).map { Self.elapsedString(since: $0) }
+        status(of: service, in: captureSnapshot(forPorts: [service.port]))
     }
 
     /// `ps` etime formatting shared by the single-service and snapshot
@@ -108,8 +84,9 @@ public struct ServiceManager: Sendable {
     func captureSnapshot(forPorts portList: [Int]) -> SystemSnapshot {
         let listeners = ports.listeningPids(onPorts: portList)
         var boundPids: [Int32] = []
+        var seen: Set<Int32> = []
         for pids in listeners.values {
-            for pid in pids where !boundPids.contains(pid) { boundPids.append(pid) }
+            for pid in pids where seen.insert(pid).inserted { boundPids.append(pid) }
         }
         let stats = ports.processStats(of: boundPids)
         let created = tmux.listSessions()
@@ -151,14 +128,44 @@ public struct ServiceManager: Sendable {
     /// Results are returned in config order. The system is interrogated once
     /// up front (see `SystemSnapshot`); only health checks fan out.
     public func statusAll(excluding: Set<String> = []) -> [ServiceStatus] {
-        let services = config.services.filter { !excluding.contains($0.name) }
-        guard !services.isEmpty else { return [] }
-        let snapshot = captureSnapshot(forPorts: services.map(\.port))
-        let box = ConcurrentBox<ServiceStatus>()
-        DispatchQueue.concurrentPerform(iterations: services.count) { i in
-            box.set(status(of: services[i], in: snapshot), at: i)
+        Self.statusAll(of: [self], excluding: [config.name: excluding])[0]
+    }
+
+    /// Status for every service of every manager, in config order per manager,
+    /// sharing ONE system interrogation across all projects: the per-manager
+    /// path repeats the (server-global) tmux queries once per project and runs
+    /// a separate lsof/ps per project, all answering about the same system.
+    /// The capture goes through the first manager's runner — every manager in
+    /// a workspace shares it.
+    public static func statusAll(
+        of managers: [ServiceManager],
+        excluding: [String: Set<String>] = [:]
+    ) -> [[ServiceStatus]] {
+        let perManager: [[ServiceConfig]] = managers.map { manager in
+            let excluded = excluding[manager.config.name] ?? []
+            return manager.config.services.filter { !excluded.contains($0.name) }
         }
-        return box.collect(count: services.count)
+        var seenPorts: Set<Int> = []
+        let allPorts = perManager.flatMap { $0.map(\.port) }.filter { seenPorts.insert($0).inserted }
+        guard let first = managers.first, !allPorts.isEmpty else {
+            return perManager.map { _ in [] }
+        }
+        let snapshot = first.captureSnapshot(forPorts: allPorts)
+        // Only the per-port health checks fan out.
+        let pairs: [(manager: Int, service: ServiceConfig)] = perManager.enumerated()
+            .flatMap { i, services in services.map { (i, $0) } }
+        let box = ConcurrentBox<ServiceStatus>()
+        DispatchQueue.concurrentPerform(iterations: pairs.count) { i in
+            box.set(managers[pairs[i].manager].status(of: pairs[i].service, in: snapshot), at: i)
+        }
+        let flat = box.collect(count: pairs.count)
+        var result: [[ServiceStatus]] = []
+        var cursor = 0
+        for services in perManager {
+            result.append(Array(flat[cursor ..< cursor + services.count]))
+            cursor += services.count
+        }
+        return result
     }
 
     // MARK: - JDK
