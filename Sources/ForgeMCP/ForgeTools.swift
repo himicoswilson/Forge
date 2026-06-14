@@ -224,20 +224,20 @@ public struct ForgeTools: Sendable {
                     scope = projects
                 }
                 let ignored = Self.loadIgnored()
-                let pc = Collector<ProjectPayload>()
-                DispatchQueue.concurrentPerform(iterations: scope.count) { i in
-                    let mgr = scope[i]
-                    let excluded = Self.ignoredNames(project: mgr.config.name, in: ignored)
-                    let statuses = mgr.statusAll(excluding: excluded)
-                    let p = ProjectPayload(
+                let excluded = Dictionary(
+                    scope.map { ($0.config.name, Self.ignoredNames(project: $0.config.name, in: ignored)) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+                // One system interrogation shared across all projects.
+                let statuses = ServiceManager.statusAll(of: scope, excluding: excluded)
+                let payload = WorkspacePayload(projects: zip(scope, statuses).map { mgr, sts in
+                    ProjectPayload(
                         name: mgr.config.name,
                         root: mgr.projectRoot.path,
                         jdk: mgr.config.jdk,
-                        services: statuses.map { StatusPayload($0, project: mgr.config.name) }
+                        services: sts.map { StatusPayload($0, project: mgr.config.name) }
                     )
-                    pc.set(p, at: i)
-                }
-                let payload = WorkspacePayload(projects: pc.collect(upTo: scope.count))
+                })
                 return try CallTool.Result(content: [textContent(Self.json(payload))], structuredContent: payload)
 
             // MARK: get_service
@@ -435,9 +435,15 @@ public struct ForgeTools: Sendable {
         }
     }
 
-    private static func json<T: Encodable>(_ value: T) throws -> String {
+    /// One encoder, reused: `JSONEncoder` is immutable once configured and
+    /// safe to share; allocating a fresh one per response was pure overhead.
+    nonisolated(unsafe) private static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return String(data: try encoder.encode(value), encoding: .utf8) ?? "{}"
+        return encoder
+    }()
+
+    private static func json<T: Encodable>(_ value: T) throws -> String {
+        String(data: try encoder.encode(value), encoding: .utf8) ?? "{}"
     }
 }

@@ -19,18 +19,6 @@ public struct PortChecker: Sendable {
             .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
     }
 
-    /// Memory (RSS in KB) and elapsed time for a PID via `ps -o rss=,etime=`.
-    public func processInfo(pid: Int32) -> (memoryKB: Int, uptime: String)? {
-        guard let result = try? runner.run("ps", ["-o", "rss=,etime=", "-p", "\(pid)"]),
-              result.succeeded else {
-            return nil
-        }
-        let fields = result.stdout.split(separator: " ", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        guard fields.count >= 2, let rss = Int(fields[0]) else { return nil }
-        return (memoryKB: rss, uptime: fields[1])
-    }
-
     // MARK: - Batched queries (one subprocess for any number of ports/pids)
 
     /// rss/etime for one process, from a batched `ps` call.

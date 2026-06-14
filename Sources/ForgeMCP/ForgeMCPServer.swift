@@ -111,8 +111,13 @@ private actor RequestRouter {
         transport = nil
     }
 
+    /// Byte pre-filter: a JSON body whose method is "initialize" must contain
+    /// these bytes, so everything else (every tool call) skips the parse.
+    private static let initializeMarker = Data("initialize".utf8)
+
     private func isInitializeRequest(_ request: HTTPRequest) -> Bool {
         guard let body = request.body,
+              body.range(of: Self.initializeMarker) != nil,
               let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
         else { return false }
         return (json["method"] as? String) == "initialize"

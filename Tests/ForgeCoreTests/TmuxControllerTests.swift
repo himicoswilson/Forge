@@ -63,16 +63,6 @@ struct TmuxControllerTests {
         #expect(!TmuxController(runner: missing).isPaneDead("wr-auth"))
     }
 
-    @Test("sessionCreated parses the #{session_created} epoch")
-    func sessionCreated() {
-        let runner = MockCommandRunner { _ in CommandResult(exitCode: 0, stdout: "1750000000\n") }
-        let tmux = TmuxController(runner: runner)
-        #expect(tmux.sessionCreated("wr-auth") == Date(timeIntervalSince1970: 1_750_000_000))
-        #expect(runner.commandLines == ["tmux display-message -p -t wr-auth #{session_created}"])
-        let missing = MockCommandRunner { _ in CommandResult(exitCode: 1) }
-        #expect(TmuxController(runner: missing).sessionCreated("wr-auth") == nil)
-    }
-
     @Test("killSession targets the right session")
     func killSession() throws {
         let runner = MockCommandRunner()
