@@ -17,6 +17,11 @@ struct ServiceManagerTests {
         ]
     )
     let root = URL(fileURLWithPath: "/proj")
+    /// Unique per test instance (swift-testing makes a fresh struct per test),
+    /// so lifecycle tests that really write `<session>.log` never collide with
+    /// the missing-file tests on a shared directory.
+    let logsRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("forge-sm-\(UUID().uuidString)")
 
     /// Simulates a machine where the given ports are listening and the
     /// given tmux sessions exist.
@@ -29,7 +34,7 @@ struct ServiceManagerTests {
             config: config ?? self.config,
             projectRoot: root,
             runner: runner,
-            logsDirectory: URL(fileURLWithPath: "/logs"),
+            logsDirectory: logsRoot,
             health: health
         )
     }
@@ -202,7 +207,7 @@ struct ServiceManagerTests {
             ),
             projectRoot: URL(fileURLWithPath: "/projB"),
             runner: runner,
-            logsDirectory: URL(fileURLWithPath: "/logs"),
+            logsDirectory: logsRoot,
             health: .simulating()
         )
 
@@ -251,7 +256,8 @@ struct ServiceManagerTests {
         let runner = world()
         try manager(runner).start(config.service(named: "train")!)
         #expect(runner.calls.last?.arguments == [
-            "pipe-pane", "-t", "wr-train", "-o", "cat >> '/logs/wr-train.log'",
+            "pipe-pane", "-t", "wr-train", "-o",
+            "cat >> '\(logsRoot.appendingPathComponent("wr-train.log").path)'",
         ])
     }
 
@@ -472,7 +478,9 @@ struct ServiceManagerTests {
 
     @Test("logs throws a clear error when the log file doesn't exist")
     func logsWithoutFile() {
-        #expect(throws: ServiceManager.LogError.noLogFile(path: "/logs/wr-auth.log")) {
+        #expect(throws: ServiceManager.LogError.noLogFile(
+            path: logsRoot.appendingPathComponent("wr-auth.log").path
+        )) {
             try manager(world()).logs(of: config.service(named: "auth")!)
         }
     }

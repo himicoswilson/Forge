@@ -355,7 +355,10 @@ public struct ServiceManager: Sendable {
         // as such, not masked by a missing log file.
         let regex = try pattern.map(LogFilter.compile)
         let file = logsDirectory.appendingPathComponent("\(config.sessionName(for: service)).log")
-        guard let data = try? Data(contentsOf: file) else {
+        // Memory-map the log: these files grow to tens of MB, and mapping
+        // hands the pages to the UTF-8 decode without first copying the whole
+        // file into the heap. Same bytes decoded — purely a peak-memory win.
+        guard let data = try? Data(contentsOf: file, options: .mappedIfSafe) else {
             throw LogError.noLogFile(path: file.path)
         }
         // Lossy UTF-8 decode: a stray non-UTF-8 byte (GBK output, binary

@@ -8,6 +8,11 @@ import Testing
 @Suite("ForgeMCP")
 struct ForgeMCPTests {
 
+    /// Unique per test instance so lifecycle tests that write `<session>.log`
+    /// never collide with the missing-file tests on a shared directory.
+    let logsRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("forge-mcp-\(UUID().uuidString)")
+
     /// Primary project: wr-prefixed services, like the original single-project setup.
     private func cloudA(_ runner: MockCommandRunner) -> ServiceManager {
         ServiceManager(
@@ -22,7 +27,7 @@ struct ForgeMCPTests {
             ),
             projectRoot: URL(fileURLWithPath: "/projects/cloud-a"),
             runner: runner,
-            logsDirectory: URL(fileURLWithPath: "/logs"),
+            logsDirectory: logsRoot,
             health: .simulating()
         )
     }
@@ -39,7 +44,7 @@ struct ForgeMCPTests {
             ),
             projectRoot: URL(fileURLWithPath: "/projects/cloud-b"),
             runner: runner,
-            logsDirectory: URL(fileURLWithPath: "/logs"),
+            logsDirectory: logsRoot,
             health: .simulating()
         )
     }
