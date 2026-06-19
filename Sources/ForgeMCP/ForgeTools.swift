@@ -437,7 +437,7 @@ public struct ForgeTools: Sendable {
 
     /// One encoder, reused: `JSONEncoder` is immutable once configured and
     /// safe to share; allocating a fresh one per response was pure overhead.
-    nonisolated(unsafe) private static let encoder: JSONEncoder = {
+    private static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return encoder

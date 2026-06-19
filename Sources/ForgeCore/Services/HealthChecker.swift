@@ -58,9 +58,7 @@ public struct HealthChecker: Sendable {
     /// Shared session: no cache/cookies, and redirects are NOT followed —
     /// the 3xx itself is interpreted (as notReady), matching what plain
     /// `curl` reported before.
-    /// URLSession is immutable and documented thread-safe; it just lacks a
-    /// `Sendable` annotation on this toolchain.
-    nonisolated(unsafe) private static let session: URLSession = {
+    private static let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 1
         configuration.timeoutIntervalForResource = 1

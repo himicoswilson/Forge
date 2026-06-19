@@ -238,7 +238,11 @@ public struct ServiceManager: Sendable {
         if tmux.hasSession(session) {
             try tmux.killSession(session)
         }
-        for pid in ports.pids(onPort: service.port) {
+        // Use listeningPids (LISTEN-only) so we only SIGTERM the process that
+        // owns the server socket. pids(onPort:) returns ALL PIDs with that port
+        // open — including Forge's own URLSession health-check connections —
+        // which would send SIGTERM to the Forge process itself and crash the app.
+        for pid in ports.listeningPids(onPorts: [service.port])[service.port] ?? [] {
             _ = try? runner.run("kill", ["-15", "\(pid)"])
         }
     }
