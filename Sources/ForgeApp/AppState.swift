@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import ServiceManagement
+import UserNotifications
 import ForgeCore
 import ForgeMCP
 
@@ -58,6 +59,12 @@ final class AppState: ObservableObject {
 
     static let pollInterval: Duration = .seconds(2)
 
+    /// Last-seen snapshots used to detect state transitions for notifications.
+    private var previousSnapshots: [ProjectSnapshot] = []
+    /// Services that became UP recently, waiting for the debounce window.
+    private var pendingUpNotices: [(project: String, name: String, port: Int)] = []
+    private var noticeDebounce: Task<Void, Never>?
+
     private var ignoredURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".forge/ignored.json")
@@ -79,6 +86,8 @@ final class AppState: ObservableObject {
     // MARK: - Lifecycle
 
     private func bootstrap() async {
+        _ = try? await UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound])
         loadIgnored()
         loadOrder()
         for root in ProjectRegistry.load() {
@@ -136,7 +145,84 @@ final class AppState: ObservableObject {
                 )
             }
         }.value
+        detectTransitions(from: snapshots, to: snaps)
         if snaps != snapshots { snapshots = snaps }
+    }
+
+    // MARK: - Notifications
+
+    /// Compares successive snapshots and fires notifications for meaningful
+    /// state changes. The first snapshot (empty → populated) is treated as
+    /// baseline — no "already UP" alerts on launch.
+    private func detectTransitions(from old: [ProjectSnapshot], to new: [ProjectSnapshot]) {
+        guard !old.isEmpty else { return }
+        var newlyUp: [(project: String, name: String, port: Int)] = []
+
+        for newSnap in new {
+            guard let oldSnap = old.first(where: { $0.name == newSnap.name }) else { continue }
+            for newSvc in newSnap.services {
+                guard let oldSvc = oldSnap.services.first(where: {
+                    $0.service.name == newSvc.service.name
+                }) else { continue }
+
+                guard oldSvc.state == .starting else { continue }
+                let key = ServiceKey(project: newSnap.name, service: newSvc.service.name)
+
+                switch newSvc.state {
+                case .up:
+                    newlyUp.append((newSnap.name, newSvc.service.name, newSvc.service.port))
+                case .down:
+                    // Only report unexpected crashes: skip user-triggered stop/restart.
+                    let action = busyAction[key]
+                    if action != .stop && action != .restart {
+                        postNotification(
+                            title: "\(newSvc.service.name) failed to start",
+                            body: "The service process exited unexpectedly — check its logs."
+                        )
+                    }
+                case .starting:
+                    break
+                }
+            }
+        }
+
+        guard !newlyUp.isEmpty else { return }
+        pendingUpNotices.append(contentsOf: newlyUp)
+        noticeDebounce?.cancel()
+        // Collect services that come UP within ~1 poll cycle into one notification.
+        noticeDebounce = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(2500))
+            guard !Task.isCancelled else { return }
+            self?.flushUpNotices()
+        }
+    }
+
+    @MainActor
+    private func flushUpNotices() {
+        let batch = pendingUpNotices
+        pendingUpNotices = []
+        guard !batch.isEmpty else { return }
+        let multiProject = Set(batch.map(\.project)).count > 1
+        if batch.count == 1 {
+            let svc = batch[0]
+            let proj = multiProject ? " · \(svc.project)" : ""
+            postNotification(title: "\(svc.name) is UP",
+                            body: "Listening on port \(svc.port)\(proj)")
+        } else {
+            let labels = batch.map { multiProject ? "\($0.project)/\($0.name)" : $0.name }
+            postNotification(title: "\(batch.count) services started",
+                            body: labels.joined(separator: " · "))
+        }
+    }
+
+    private func postNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        )
     }
 
     // MARK: - Actions

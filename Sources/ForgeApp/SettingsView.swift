@@ -4,12 +4,14 @@ import ForgeCore
 
 struct SettingsView: View {
     @EnvironmentObject var state: AppState
+    @StateObject private var envChecker = EnvironmentChecker()
     @State private var expanded: [String: Bool] = [:]
 
     var body: some View {
         List {
             mcpSection
             generalSection
+            environmentSection
             projectsSection
         }
         .listStyle(.inset)
@@ -20,6 +22,7 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .onAppear { if envChecker.checks.isEmpty { envChecker.run() } }
     }
 
     // MARK: - MCP Server
@@ -54,6 +57,34 @@ struct SettingsView: View {
                 set: { state.setLaunchAtLogin($0) }
             )) {
                 Text("Launch at Login")
+            }
+        }
+    }
+
+    // MARK: - Environment
+
+    private var environmentSection: some View {
+        Section {
+            if envChecker.isChecking {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Checking environment…").foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 2)
+            } else {
+                ForEach(envChecker.checks) { check in
+                    EnvCheckRow(check: check)
+                }
+            }
+        } header: {
+            HStack {
+                Text("Environment")
+                Spacer()
+                Button("Recheck") { envChecker.run() }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .disabled(envChecker.isChecking)
             }
         }
     }
@@ -221,5 +252,55 @@ private struct ServiceRow: View {
             }
         }
         .frame(width: 12, height: 12)
+    }
+}
+
+// MARK: - Environment check row
+
+private extension EnvCheck.Status {
+    var systemImage: String {
+        switch self {
+        case .ok:      "checkmark.circle.fill"
+        case .warning: "exclamationmark.triangle.fill"
+        case .missing: "xmark.circle.fill"
+        }
+    }
+    var color: Color {
+        switch self {
+        case .ok:      .green
+        case .warning: .orange
+        case .missing: .red
+        }
+    }
+}
+
+private struct EnvCheckRow: View {
+    let check: EnvCheck
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: check.status.systemImage)
+                .foregroundStyle(check.status.color)
+                .frame(width: 16, height: 16)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(check.name)
+                    Spacer()
+                    Text(check.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                if let hint = check.hint {
+                    Text(hint)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .monospaced()
+                }
+            }
+        }
+        .padding(.vertical, 1)
     }
 }
