@@ -14,6 +14,7 @@ struct ForgeMCPTests {
         .appendingPathComponent("forge-mcp-\(UUID().uuidString)")
 
     /// Primary project: wr-prefixed services, like the original single-project setup.
+    /// `train` has supportsHotRestart: true so hotrestart tests exercise the success path.
     private func cloudA(_ runner: MockCommandRunner) -> ServiceManager {
         ServiceManager(
             config: ForgeConfig(
@@ -22,7 +23,7 @@ struct ForgeMCPTests {
                     ServiceConfig(name: "gateway", port: 8080),
                     ServiceConfig(name: "auth", port: 9201),
                     ServiceConfig(name: "tenant", port: 9400),
-                    ServiceConfig(name: "train", port: 9700),
+                    ServiceConfig(name: "train", port: 9700, supportsHotRestart: true),
                 ]
             ),
             projectRoot: URL(fileURLWithPath: "/projects/cloud-a"),
@@ -164,7 +165,7 @@ struct ForgeMCPTests {
     @Test("get_logs without a log file explains that the file is the only source")
     func getLogsNoFile() async throws {
         let client = try await connect(.simulating())
-        let (content, isError) = try await client.callTool(name: "get_logs", arguments: ["service": "auth", "lines": 50])
+        let (content, isError) = try await client.callTool(name: "get_logs", arguments: ["service": "auth"])
         #expect(isError == true)
         #expect(text(content).contains("No log file"))
         #expect(text(content).contains("wr-auth.log"))
@@ -210,7 +211,7 @@ struct ForgeMCPTests {
         // 1. pattern + context picks out just the error blocks, '--' between them.
         let (filtered, err1) = try await client.callTool(
             name: "get_logs",
-            arguments: ["service": "gateway", "pattern": "Exception|ERROR", "context": 3, "lines": 40])
+            arguments: ["service": "gateway", "pattern": "Exception|ERROR", "context": 3])
         #expect(err1 != true)
         let t1 = text(filtered)
         #expect(t1.contains("ERROR Netty DNS resolution failed"))
@@ -227,13 +228,12 @@ struct ForgeMCPTests {
         #expect(err2 != true)
         #expect(text(none) == "(no matching log lines)")
 
-        // 3. plain tail: exactly 40 lines + the truncation note.
+        // 3. plain tail: all 65 lines returned (limit is 200, no truncation note).
         let (tail, err3) = try await client.callTool(
-            name: "get_logs", arguments: ["service": "gateway", "lines": 40])
+            name: "get_logs", arguments: ["service": "gateway"])
         #expect(err3 != true)
         let tailLines = text(tail).split(separator: "\n", omittingEmptySubsequences: false)
-        #expect(tailLines.count == 41) // note + 40 lines
-        #expect(tailLines.first?.hasPrefix("… (showing last 40 of 65 lines)") == true)
+        #expect(tailLines.count == 65)
         #expect(tailLines.last == "2020-01-01 00:00:09 ERROR second failure")
 
         // 4. since with every entry older than the window → nothing.
@@ -450,6 +450,19 @@ struct ForgeMCPTests {
         #expect(text(content).contains("Timed out"))
         #expect(text(content).contains("Last 40 log lines"))
         #expect(text(content).contains("Caused by: BeanCreationException"))
+    }
+
+    @Test("hotrestart_service rejects a service without spring-boot-devtools immediately")
+    func hotRestartNoDevTools() async throws {
+        // auth has supportsHotRestart: false (default) — should fail before any mvn call.
+        let runner = MockCommandRunner.simulating(listeningPorts: [9201: 22])
+        let client = try await connect(runner)
+        let (content, isError) = try await client.callTool(
+            name: "hotrestart_service", arguments: ["services": ["auth"]])
+        #expect(isError == true)
+        #expect(text(content).contains("does not support hot restart"))
+        #expect(text(content).contains("spring-boot-devtools"))
+        #expect(!runner.commandLines.contains { $0.contains("mvn") })
     }
 
     @Test("hotrestart_service compiles and confirms the service is back UP")

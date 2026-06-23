@@ -137,7 +137,7 @@ private struct ServiceMenuView: View {
         Menu {
             Text(stateLabel(dotState))
             Divider()
-            if status.state == .down {
+            if dotState == .down {
                 Button("Start") {
                     state.perform(.start, project: project, service: status.service)
                 }
@@ -152,6 +152,7 @@ private struct ServiceMenuView: View {
                 Button("Hot Restart") {
                     state.perform(.hotRestart, project: project, service: status.service)
                 }
+                .disabled(!status.service.supportsHotRestart)
             }
             if status.logExists {
                 Divider()

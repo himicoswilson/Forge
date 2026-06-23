@@ -6,13 +6,29 @@ public struct ServiceConfig: Sendable, Codable, Equatable, Hashable, Identifiabl
     public let port: Int
     /// Maven module the service lives in. Defaults to `<prefix>-<name>` when omitted.
     public let module: String?
+    /// True when the service's pom.xml declares spring-boot-devtools (detected at discovery
+    /// time). Hot Restart is unavailable without it. Can be forced true in .forge/config.json.
+    public let supportsHotRestart: Bool
 
     public var id: String { name }
 
-    public init(name: String, port: Int, module: String? = nil) {
+    public init(name: String, port: Int, module: String? = nil, supportsHotRestart: Bool = false) {
         self.name = name
         self.port = port
         self.module = module
+        self.supportsHotRestart = supportsHotRestart
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, port, module, supportsHotRestart
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        port = try c.decode(Int.self, forKey: .port)
+        module = try c.decodeIfPresent(String.self, forKey: .module)
+        supportsHotRestart = try c.decodeIfPresent(Bool.self, forKey: .supportsHotRestart) ?? false
     }
 }
 
@@ -74,7 +90,9 @@ public struct ForgeConfig: Sendable, Equatable {
                 services[index] = ServiceConfig(
                     name: override.name,
                     port: override.port,
-                    module: override.module ?? services[index].module
+                    module: override.module ?? services[index].module,
+                    // Config can force true; otherwise keep what discovery found in pom.xml.
+                    supportsHotRestart: override.supportsHotRestart || services[index].supportsHotRestart
                 )
             } else {
                 services.append(override)

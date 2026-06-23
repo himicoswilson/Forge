@@ -92,6 +92,7 @@ struct SettingsView: View {
                         ForEach(services, id: \.service.id) { svc in
                             ServiceRow(
                                 svc: svc,
+                                project: project.name,
                                 ignored: state.isIgnored(
                                     project: project.name,
                                     service: svc.service.name
@@ -167,8 +168,19 @@ private struct ProjectLabel: View {
 
 private struct ServiceRow: View {
     let svc: DisplayStatus
+    let project: String
     let ignored: Bool
     let onToggle: () -> Void
+    @EnvironmentObject var state: AppState
+
+    private var effectiveState: ServiceState {
+        let key = ServiceKey(project: project, service: svc.service.name)
+        switch state.busyAction[key] {
+        case .start, .restart, .hotRestart: return .starting
+        case .stop:                         return .down
+        case nil:                           return svc.state
+        }
+    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -197,7 +209,7 @@ private struct ServiceRow: View {
 
     private var dotView: some View {
         ZStack {
-            switch svc.state {
+            switch effectiveState {
             case .up:
                 Circle().fill(Color.green).frame(width: 8, height: 8)
             case .starting:

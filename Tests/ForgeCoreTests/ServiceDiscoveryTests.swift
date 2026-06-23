@@ -147,6 +147,42 @@ struct ServiceDiscoveryTests {
         #expect(ServiceDiscovery.discover(projectRoot: root) == .empty)
     }
 
+    @Test("supportsHotRestart is true when pom.xml contains spring-boot-devtools")
+    func detectsDevTools() throws {
+        let root = try makeProject(
+            rootModules: ["ruoyi-auth", "ruoyi-gateway"],
+            modules: [
+                "ruoyi-auth": ("ruoyi-auth", ["bootstrap.yml": "server:\n  port: 9200\n"]),
+                "ruoyi-gateway": ("ruoyi-gateway", ["bootstrap.yml": "server:\n  port: 8080\n"]),
+            ]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // Inject spring-boot-devtools into the auth module pom only.
+        let authPom = root.appendingPathComponent("ruoyi-auth/pom.xml")
+        var pomText = (try? String(contentsOf: authPom, encoding: .utf8)) ?? ""
+        pomText = pomText.replacingOccurrences(
+            of: "</project>",
+            with: """
+              <dependencies>
+                <dependency>
+                  <groupId>org.springframework.boot</groupId>
+                  <artifactId>spring-boot-devtools</artifactId>
+                  <optional>true</optional>
+                </dependency>
+              </dependencies>
+            </project>
+            """
+        )
+        try pomText.write(to: authPom, atomically: true, encoding: .utf8)
+
+        let discovery = ServiceDiscovery.discover(projectRoot: root)
+        let auth = discovery.services.first { $0.name == "auth" }
+        let gateway = discovery.services.first { $0.name == "gateway" }
+        #expect(auth?.supportsHotRestart == true)
+        #expect(gateway?.supportsHotRestart == false)
+    }
+
     // MARK: - Port parsing
 
     @Test("YAML scan finds port only inside the server block")

@@ -17,6 +17,9 @@ public struct StatusPayload: Codable, Sendable, Equatable {
     public let uptime: String?
     /// How long the service has been in `starting` (e.g. "00:42"), nil otherwise.
     public let startingFor: String?
+    /// Whether the service declares spring-boot-devtools in its pom.xml.
+    /// Hot restart is a no-op (and rejected) when false.
+    public let supportsHotRestart: Bool
 
     init(_ status: ServiceStatus, project: String) {
         self.project = project
@@ -27,6 +30,7 @@ public struct StatusPayload: Codable, Sendable, Equatable {
         memoryKB = status.memoryKB
         uptime = status.uptime
         startingFor = status.startingFor
+        supportsHotRestart = status.service.supportsHotRestart
     }
 }
 
@@ -124,7 +128,7 @@ public struct ForgeTools: Sendable {
         ),
         Tool(
             name: "get_logs",
-            description: "Service log, tail or regex search, from the durable log file (~/.forge/logs/<session>.log — full history since start; only exists for services started by Forge). Combine pattern + context to jump straight to exception stacks instead of paging through a plain tail.",
+            description: "Service log, tail or regex search, from the durable log file (~/.forge/logs/<session>.log — full history since start; only exists for services started by Forge). Always returns at most 200 lines (the most recent). Use pattern + context to jump straight to exception stacks instead of reading a plain tail.",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -133,10 +137,6 @@ public struct ForgeTools: Sendable {
                         "description": "Service name as declared in .forge/config.json",
                     ],
                     "project": projectArg,
-                    "lines": [
-                        "type": "integer",
-                        "description": "Maximum lines to return, keeping the most recent (default 100)",
-                    ],
                     "pattern": [
                         "type": "string",
                         "description": "Regex — return only matching lines (e.g. \"Exception|ERROR\") instead of a plain tail",
@@ -178,7 +178,7 @@ public struct ForgeTools: Sendable {
         ),
         Tool(
             name: "hotrestart_service",
-            description: "Recompile one or more services' Maven modules so Spring DevTools hot-reloads them, then confirm each service reports UP again. All compiles run in parallel.",
+            description: "Recompile one or more services' Maven modules so Spring DevTools hot-reloads them, then confirm each service reports UP again. All compiles run in parallel. Only works for services where supportsHotRestart is true (spring-boot-devtools detected in pom.xml); unsupported services fail immediately with a clear message.",
             inputSchema: multiServiceSchema(extra: [
                 "wait": waitArg("After compiling, wait until the service reports UP again (default: true). Set false to skip the confirmation."),
                 "timeoutSeconds": timeoutArg,
@@ -253,7 +253,7 @@ public struct ForgeTools: Sendable {
                 let since = try args["since"]?.stringValue.map(LogFilter.parseDuration)
                 let output = try mgr.logs(
                     of: svc,
-                    lines: args["lines"]?.intValue ?? 100,
+                    lines: 200,
                     pattern: pattern,
                     context: args["context"]?.intValue ?? 0,
                     since: since
@@ -319,6 +319,13 @@ public struct ForgeTools: Sendable {
                 let timeout = args["timeoutSeconds"]?.intValue ?? 180
                 let (lines, hadError) = concurrently(pairs) { mgr, svc in
                     let label = "\(mgr.config.name)/\(svc.name)"
+                    guard svc.supportsHotRestart else {
+                        throw ToolError.failed(
+                            "\(label) does not support hot restart — spring-boot-devtools was not found"
+                            + " in its pom.xml. Add org.springframework.boot:spring-boot-devtools to its"
+                            + " dependencies, or set \"supportsHotRestart\": true in .forge/config.json."
+                        )
+                    }
                     let module = mgr.config.module(for: svc)
                     try mgr.hotRestart(svc)
                     guard wait else { return "Compiled '\(module)' — Spring DevTools will reload \(label)." }
