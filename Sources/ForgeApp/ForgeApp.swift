@@ -131,6 +131,13 @@ private struct MenuContent: View {
                             .disabled(!active.contains { $0.state == .down })
                         Button("Stop All") { state.stopAll(project: project.name) }
                             .disabled(!active.contains { $0.state != .down })
+                        let groups = state.serviceGroups.filter { $0.project == project.name }
+                        if !groups.isEmpty {
+                            Divider()
+                            ForEach(groups) { group in
+                                Button(group.name) { state.startGroup(group) }
+                            }
+                        }
                     }
                     Menu("Build") {
                         Button("Build All") { state.buildAll(project: project.name) }

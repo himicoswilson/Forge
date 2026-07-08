@@ -6,6 +6,19 @@ struct SettingsView: View {
     @EnvironmentObject var state: AppState
     @StateObject private var envChecker = EnvironmentChecker()
     @State private var expanded: [String: Bool] = [:]
+    @State private var showAddGroupSheet: Bool = false
+    @State private var editingGroup: ServiceGroup?
+
+    private enum GroupSheetMode: Identifiable {
+        case add, edit(ServiceGroup)
+        var id: String {
+            switch self {
+            case .add: return "add"
+            case .edit(let g): return "edit-\(g.id)"
+            }
+        }
+    }
+    @State private var groupSheet: GroupSheetMode?
 
     var body: some View {
         List {
@@ -13,6 +26,7 @@ struct SettingsView: View {
             generalSection
             environmentSection
             projectsSection
+            groupsSection
         }
         .listStyle(.inset)
         .frame(minWidth: 440, minHeight: 320)
@@ -23,6 +37,14 @@ struct SettingsView: View {
         }
         .navigationTitle("Settings")
         .onAppear { if envChecker.checks.isEmpty { envChecker.run() } }
+        .sheet(item: $groupSheet) { mode in
+            switch mode {
+            case .add:
+                AddGroupSheet(state: state)
+            case .edit(let group):
+                EditGroupSheet(state: state, group: group)
+            }
+        }
     }
 
     // MARK: - MCP Server
@@ -252,6 +274,203 @@ private struct ServiceRow: View {
             }
         }
         .frame(width: 12, height: 12)
+    }
+}
+
+// MARK: - Service Groups
+
+extension SettingsView {
+    private var groupsSection: some View {
+        Section {
+            if state.serviceGroups.isEmpty {
+                Text("No service groups defined")
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
+            } else {
+                ForEach(state.serviceGroups) { group in
+                    HStack(spacing: 8) {
+                        Image(systemName: "square.stack.3d.up")
+                            .foregroundStyle(.secondary)
+                        Text(group.name)
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(group.services.count) services")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                    .onTapGesture { groupSheet = .edit(group) }
+                    .contextMenu {
+                        Button("Edit…") { groupSheet = .edit(group) }
+                        Divider()
+                        if let idx = state.serviceGroups.firstIndex(where: { $0.id == group.id }) {
+                            if idx > 0 {
+                                Button("Move Up") { state.moveGroup(from: IndexSet(integer: idx), to: idx - 1) }
+                            }
+                            if idx < state.serviceGroups.count - 1 {
+                                Button("Move Down") { state.moveGroup(from: IndexSet(integer: idx), to: idx + 2) }
+                            }
+                        }
+                        Divider()
+                        Button("Delete", role: .destructive) { state.removeGroup(group.id) }
+                    }
+                }
+                .onMove { from, to in
+                    state.moveGroup(from: from, to: to)
+                }
+            }
+        } header: {
+            HStack {
+                Text("Service Groups")
+                Spacer()
+                Button(action: { groupSheet = .add }) {
+                    Image(systemName: "plus")
+                        .imageScale(.small)
+                }
+                .buttonStyle(.plain)
+                .help("Add service group")
+            }
+        }
+    }
+}
+
+/// Sheet for creating a new service group.
+private struct AddGroupSheet: View {
+    @ObservedObject var state: AppState
+    @State private var name: String = ""
+    @State private var projectIndex: Int = 0
+    @State private var selectedServices: Set<String> = []
+    @Environment(\.dismiss) private var dismiss
+
+    private var availableServices: [DisplayStatus] {
+        guard state.snapshots.indices.contains(projectIndex) else { return [] }
+        return state.orderedServices(for: state.snapshots[projectIndex].name)
+    }
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("New Service Group")
+                .font(.headline)
+            TextField("Group name", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 260)
+            if !state.snapshots.isEmpty {
+                Picker("Project", selection: $projectIndex) {
+                    ForEach(state.snapshots.indices, id: \.self) { i in
+                        Text(state.snapshots[i].name).tag(i)
+                    }
+                }
+                .frame(width: 260)
+                .onChange(of: projectIndex) { _ in selectedServices.removeAll() }
+            }
+            if !availableServices.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Services")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(availableServices, id: \.service.id) { svc in
+                                Toggle(svc.service.name, isOn: Binding(
+                                    get: { selectedServices.contains(svc.service.name) },
+                                    set: { on in
+                                        if on { selectedServices.insert(svc.service.name) }
+                                        else { selectedServices.remove(svc.service.name) }
+                                    }
+                                ))
+                                .font(.callout)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 200)
+                }
+                .frame(width: 260)
+            }
+            HStack {
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create") {
+                    let project = state.snapshots.indices.contains(projectIndex)
+                        ? state.snapshots[projectIndex].name : ""
+                    var group = ServiceGroup(name: name, project: project)
+                    group.services = selectedServices.sorted()
+                    state.updateGroup(group)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(name.isEmpty || state.snapshots.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 320)
+    }
+}
+
+/// Sheet for editing an existing service group.
+private struct EditGroupSheet: View {
+    @ObservedObject var state: AppState
+    @State private var localGroup: ServiceGroup
+    @Environment(\.dismiss) private var dismiss
+
+    init(state: AppState, group: ServiceGroup) {
+        self.state = state
+        _localGroup = State(initialValue: group)
+    }
+
+    private var availableServices: [DisplayStatus] {
+        state.orderedServices(for: localGroup.project)
+    }
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("Edit Group")
+                .font(.headline)
+            TextField("Group name", text: $localGroup.name)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 260)
+                .onChange(of: localGroup.name) { _ in save() }
+            HStack {
+                Text("Project:")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(localGroup.project)
+                    .font(.callout)
+            }
+            .frame(width: 260, alignment: .leading)
+            if !availableServices.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Services")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(availableServices, id: \.service.id) { svc in
+                                Toggle(svc.service.name, isOn: Binding(
+                                    get: { localGroup.services.contains(svc.service.name) },
+                                    set: { on in
+                                        if on { localGroup.services.append(svc.service.name) }
+                                        else { localGroup.services.removeAll { $0 == svc.service.name } }
+                                        save()
+                                    }
+                                ))
+                                .font(.callout)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 200)
+                }
+                .frame(width: 260)
+            }
+            Button("Done") { dismiss() }
+                .keyboardShortcut(.defaultAction)
+        }
+        .padding(20)
+        .frame(width: 320)
+    }
+
+    private func save() {
+        state.updateGroup(localGroup)
     }
 }
 

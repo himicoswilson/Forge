@@ -36,6 +36,21 @@ struct ServiceKey: Hashable {
     let service: String
 }
 
+/// A user-defined named group of services for quick batch operations.
+struct ServiceGroup: Identifiable, Equatable, Codable, Hashable {
+    let id: UUID
+    var name: String
+    var project: String
+    var services: [String]
+
+    init(id: UUID = UUID(), name: String, project: String, services: [String] = []) {
+        self.id = id
+        self.name = name
+        self.project = project
+        self.services = services
+    }
+}
+
 enum ServiceAction {
     case start, stop, restart, hotRestart, build, cleanBuild, startWithBuild
 }
@@ -51,6 +66,7 @@ final class AppState: ObservableObject {
     @Published var lastError: String?
     @Published var ignoredServices: Set<String> = []
     @Published var serviceOrder: [String: [String]] = [:]
+    @Published var serviceGroups: [ServiceGroup] = []
     @Published var launchAtLogin: Bool = (SMAppService.mainApp.status == .enabled)
 
     private let workspace = Workspace()
@@ -77,6 +93,11 @@ final class AppState: ObservableObject {
             .appendingPathComponent(".forge/order.json")
     }
 
+    private var groupsURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".forge/groups.json")
+    }
+
     init() {
         Task { await bootstrap() }
     }
@@ -92,6 +113,7 @@ final class AppState: ObservableObject {
             .requestAuthorization(options: [.alert, .sound])
         loadIgnored()
         loadOrder()
+        loadGroups()
         for root in ProjectRegistry.load() {
             _ = try? await workspace.addProject(root: root)
         }
@@ -497,6 +519,73 @@ final class AppState: ObservableObject {
             withIntermediateDirectories: true
         )
         try? data.write(to: orderURL, options: .atomic)
+    }
+
+    // MARK: - Service Groups
+
+    func addGroup(name: String, project: String) {
+        serviceGroups.append(ServiceGroup(name: name, project: project))
+        saveGroups()
+    }
+
+    func updateGroup(_ group: ServiceGroup) {
+        if let idx = serviceGroups.firstIndex(where: { $0.id == group.id }) {
+            serviceGroups[idx] = group
+        } else {
+            serviceGroups.append(group)
+        }
+        saveGroups()
+    }
+
+    func removeGroup(_ id: UUID) {
+        serviceGroups.removeAll { $0.id == id }
+        saveGroups()
+    }
+
+    func moveGroup(from source: IndexSet, to destination: Int) {
+        serviceGroups.move(fromOffsets: source, toOffset: destination)
+        saveGroups()
+    }
+
+    /// Start all services in a group that are currently down.
+    func startGroup(_ group: ServiceGroup) {
+        for name in group.services {
+            guard let svc = orderedServices(for: group.project)
+                .first(where: { $0.service.name == name })?.service
+            else { continue }
+            perform(.start, project: group.project, service: svc)
+        }
+    }
+
+    /// Stop all services in a group that are currently up or starting.
+    func stopGroup(_ group: ServiceGroup) {
+        for name in group.services {
+            let key = ServiceKey(project: group.project, service: name)
+            guard let status = orderedServices(for: group.project)
+                .first(where: { $0.service.name == name })
+            else { continue }
+            let effective = busyAction[key] != nil
+                ? effectiveState(busyAction[key]!)
+                : status.state
+            guard effective != .down else { continue }
+            perform(.stop, project: group.project, service: status.service)
+        }
+    }
+
+    private func loadGroups() {
+        guard let data = try? Data(contentsOf: groupsURL),
+              let list = try? JSONDecoder().decode([ServiceGroup].self, from: data)
+        else { return }
+        serviceGroups = list
+    }
+
+    private func saveGroups() {
+        guard let data = try? JSONEncoder().encode(serviceGroups) else { return }
+        try? FileManager.default.createDirectory(
+            at: groupsURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: groupsURL, options: .atomic)
     }
 
     // MARK: - Launch at Login
