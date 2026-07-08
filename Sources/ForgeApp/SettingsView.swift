@@ -207,7 +207,7 @@ private struct ServiceRow: View {
     private var effectiveState: ServiceState {
         let key = ServiceKey(project: project, service: svc.service.name)
         switch state.busyAction[key] {
-        case .start, .restart, .hotRestart: return .starting
+        case .start, .restart, .hotRestart, .build, .cleanBuild, .startWithBuild: return .starting
         case .stop:                         return .down
         case nil:                           return svc.state
         }

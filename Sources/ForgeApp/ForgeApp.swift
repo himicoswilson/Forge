@@ -126,10 +126,16 @@ private struct MenuContent: View {
                 let active = state.orderedServices(for: project.name)
                     .filter { !state.isIgnored(project: project.name, service: $0.service.name) }
                 Section(project.name) {
-                    Button("Start All") { state.startAll(project: project.name) }
-                        .disabled(!active.contains { $0.state == .down })
-                    Button("Stop All") { state.stopAll(project: project.name) }
-                        .disabled(!active.contains { $0.state != .down })
+                    Menu("Service Control") {
+                        Button("Start All") { state.startAll(project: project.name) }
+                            .disabled(!active.contains { $0.state == .down })
+                        Button("Stop All") { state.stopAll(project: project.name) }
+                            .disabled(!active.contains { $0.state != .down })
+                    }
+                    Menu("Build") {
+                        Button("Build All") { state.buildAll(project: project.name) }
+                        Button("Clean Build All") { state.cleanBuildAll(project: project.name) }
+                    }
                     Divider()
                     ForEach(active, id: \.service.id) { status in
                         ServiceMenuView(status: status, project: project.name)
@@ -169,6 +175,9 @@ private struct ServiceMenuView: View {
                 Button("Start") {
                     state.perform(.start, project: project, service: status.service)
                 }
+                Button("Start with Build") {
+                    state.perform(.startWithBuild, project: project, service: status.service)
+                }
             } else {
                 Button("Stop") {
                     state.perform(.stop, project: project, service: status.service)
@@ -181,6 +190,13 @@ private struct ServiceMenuView: View {
                     state.perform(.hotRestart, project: project, service: status.service)
                 }
                 .disabled(!status.service.supportsHotRestart)
+            }
+            Divider()
+            Button("Build") {
+                state.perform(.build, project: project, service: status.service)
+            }
+            Button("Clean Build") {
+                state.perform(.cleanBuild, project: project, service: status.service)
             }
             if status.logExists {
                 Divider()
@@ -204,9 +220,13 @@ private struct ServiceMenuView: View {
 
     /// While an action is in-flight the dot shows the expected transitional
     /// state immediately, without waiting for the next poll cycle.
+    /// Also checks the wildcard key ("*") used by buildAll so every service
+    /// in the project shows the building dot.
     private func effectiveDotState(for key: ServiceKey) -> ServiceState {
-        switch state.busyAction[key] {
-        case .start, .restart, .hotRestart: return .starting
+        let wildcard = ServiceKey(project: key.project, service: "*")
+        let action = state.busyAction[key] ?? state.busyAction[wildcard]
+        switch action {
+        case .start, .restart, .hotRestart, .build, .cleanBuild, .startWithBuild: return .starting
         case .stop:                         return .down
         case nil:                           return status.state
         }

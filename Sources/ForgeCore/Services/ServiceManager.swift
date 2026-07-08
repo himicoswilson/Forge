@@ -219,6 +219,9 @@ public struct ServiceManager: Sendable {
     /// then run only the target module with the fully qualified goal.
     /// The `env` prefix (not `VAR=… cmd`) keeps it valid under fish,
     /// which tmux may use as the session shell.
+    /// Starts the service in a tmux session.  Runs only
+    /// `mvn spring-boot:run -pl <module>` — fast startup that skips the
+    /// build step.  Use `startWithBuild` when dependencies may be stale.
     public func start(_ service: ServiceConfig) throws {
         let session = config.sessionName(for: service)
         // A dead pane left behind by remain-on-exit would make new-session
@@ -230,8 +233,7 @@ public struct ServiceManager: Sendable {
         try? FileManager.default.removeItem(at: logFile)
         let module = config.module(for: service)
         let env = javaHome().map { "env JAVA_HOME=\"\($0)\" " } ?? ""
-        let command = "\(env)mvn install -pl \(module) -am -DskipTests"
-            + " && \(env)mvn org.springframework.boot:spring-boot-maven-plugin:run -pl \(module)"
+        let command = "\(env)mvn org.springframework.boot:spring-boot-maven-plugin:run -pl \(module)"
         try tmux.newSession(
             name: session,
             command: command,
@@ -314,6 +316,25 @@ public struct ServiceManager: Sendable {
         }
     }
 
+    /// Idempotent start-with-build: like `startIfNeeded` but runs `mvn install`
+    /// before launching when the service is down.
+    public func startWithBuildIfNeeded(_ service: ServiceConfig) throws -> StartOutcome {
+        switch status(of: service).state {
+        case .up: return .alreadyUp
+        case .starting: return .alreadyStarting
+        case .down:
+            try startWithBuild(service)
+            return .started
+        }
+    }
+
+    /// Full restart with build: stop, wait for down, then start with `mvn install`.
+    public func restartWithBuild(_ service: ServiceConfig) throws {
+        try stop(service)
+        waitForDown(service)
+        try startWithBuild(service)
+    }
+
     /// Blocks until the service's port goes quiet (service left UP state) and
     /// then comes back UP. Used after a hot-restart compile: DevTools detects
     /// the new classes and triggers a context reload, causing a brief dip.
@@ -355,6 +376,128 @@ public struct ServiceManager: Sendable {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 : result.stderr
             throw CommandError.failed(command: "mvn compile -pl \(module)", exitCode: result.exitCode, stderr: detail)
+        }
+    }
+
+    /// Builds the service's Maven module (and its dependencies) without
+    /// starting it.  Runs `mvn package -pl <module> -am -DskipTests`
+    /// synchronously — the caller awaits the result.  Incremental: only
+    /// recompiles changed sources (no `clean`).
+    public func build(_ service: ServiceConfig) throws {
+        let module = config.module(for: service)
+        let mvnArgs = ["package", "-pl", module, "-am", "-DskipTests"]
+        let result: CommandResult
+        if let home = javaHome() {
+            result = try runner.run("env", ["JAVA_HOME=\(home)", "mvn"] + mvnArgs, workingDirectory: projectRoot)
+        } else {
+            result = try runner.run("mvn", mvnArgs, workingDirectory: projectRoot)
+        }
+        guard result.succeeded else {
+            let detail = result.stderr.isEmpty
+                ? result.stdout
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .suffix(40)
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                : result.stderr
+            throw CommandError.failed(command: "mvn package -pl \(module)", exitCode: result.exitCode, stderr: detail)
+        }
+    }
+
+    /// Builds all modules in the project without starting any service.
+    /// Runs `mvn package -DskipTests` synchronously.  Incremental (no `clean`).
+    public func buildAll() throws {
+        let mvnArgs = ["package", "-DskipTests"]
+        let result: CommandResult
+        if let home = javaHome() {
+            result = try runner.run("env", ["JAVA_HOME=\(home)", "mvn"] + mvnArgs, workingDirectory: projectRoot)
+        } else {
+            result = try runner.run("mvn", mvnArgs, workingDirectory: projectRoot)
+        }
+        guard result.succeeded else {
+            let detail = result.stderr.isEmpty
+                ? result.stdout
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .suffix(40)
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                : result.stderr
+            throw CommandError.failed(command: "mvn package", exitCode: result.exitCode, stderr: detail)
+        }
+    }
+
+    /// Full rebuild of the service's Maven module (and its dependencies).
+    /// Runs `mvn clean package -pl <module> -am -DskipTests` synchronously.
+    /// Use when incremental builds fail or dependencies are stale.
+    public func cleanBuild(_ service: ServiceConfig) throws {
+        let module = config.module(for: service)
+        let mvnArgs = ["clean", "package", "-pl", module, "-am", "-DskipTests"]
+        let result: CommandResult
+        if let home = javaHome() {
+            result = try runner.run("env", ["JAVA_HOME=\(home)", "mvn"] + mvnArgs, workingDirectory: projectRoot)
+        } else {
+            result = try runner.run("mvn", mvnArgs, workingDirectory: projectRoot)
+        }
+        guard result.succeeded else {
+            let detail = result.stderr.isEmpty
+                ? result.stdout
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .suffix(40)
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                : result.stderr
+            throw CommandError.failed(command: "mvn clean package -pl \(module)", exitCode: result.exitCode, stderr: detail)
+        }
+    }
+
+    /// Full rebuild of all modules in the project.
+    /// Runs `mvn clean package -DskipTests` synchronously.
+    public func cleanBuildAll() throws {
+        let mvnArgs = ["clean", "package", "-DskipTests"]
+        let result: CommandResult
+        if let home = javaHome() {
+            result = try runner.run("env", ["JAVA_HOME=\(home)", "mvn"] + mvnArgs, workingDirectory: projectRoot)
+        } else {
+            result = try runner.run("mvn", mvnArgs, workingDirectory: projectRoot)
+        }
+        guard result.succeeded else {
+            let detail = result.stderr.isEmpty
+                ? result.stdout
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .suffix(40)
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                : result.stderr
+            throw CommandError.failed(command: "mvn clean package", exitCode: result.exitCode, stderr: detail)
+        }
+    }
+
+    /// Starts the service with a full build first.  Runs
+    /// `mvn install -pl <module> -am -DskipTests && spring-boot:run`
+    /// in a tmux session — slower but guarantees fresh dependencies.
+    public func startWithBuild(_ service: ServiceConfig) throws {
+        let session = config.sessionName(for: service)
+        if tmux.hasSession(session), tmux.isPaneDead(session) {
+            try? tmux.killSession(session)
+        }
+        let logFile = logsDirectory.appendingPathComponent("\(session).log")
+        try? FileManager.default.removeItem(at: logFile)
+        let module = config.module(for: service)
+        let env = javaHome().map { "env JAVA_HOME=\"\($0)\" " } ?? ""
+        let command = "\(env)mvn install -pl \(module) -am -DskipTests"
+            + " && \(env)mvn org.springframework.boot:spring-boot-maven-plugin:run -pl \(module)"
+        try tmux.newSession(
+            name: session,
+            command: command,
+            workingDirectory: projectRoot
+        )
+        try? FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: logFile.path, contents: nil)
+        do {
+            try tmux.pipePane(session: session, toFile: logFile.path)
+        } catch {
+            try? Data("(forge: tmux pipe-pane failed — session output is not being mirrored: \(error))\n".utf8)
+                .write(to: logFile)
         }
     }
 

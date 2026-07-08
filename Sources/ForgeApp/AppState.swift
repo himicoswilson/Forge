@@ -37,7 +37,7 @@ struct ServiceKey: Hashable {
 }
 
 enum ServiceAction {
-    case start, stop, restart, hotRestart
+    case start, stop, restart, hotRestart, build, cleanBuild, startWithBuild
 }
 
 /// Owns the multi-project workspace, the MCP server, status polling,
@@ -256,10 +256,13 @@ final class AppState: ObservableObject {
             let outcome = await Task.detached(priority: .userInitiated) {
                 Result {
                     switch action {
-                    case .start:      try manager.start(service)
-                    case .stop:       try manager.stop(service)
-                    case .restart:    try manager.restart(service)
-                    case .hotRestart: try manager.hotRestart(service)
+                    case .start:        try manager.start(service)
+                    case .stop:         try manager.stop(service)
+                    case .restart:      try manager.restart(service)
+                    case .hotRestart:   try manager.hotRestart(service)
+                    case .build:        try manager.build(service)
+                    case .cleanBuild:   try manager.cleanBuild(service)
+                    case .startWithBuild: try manager.startWithBuild(service)
                     }
                 }
             }.value
@@ -271,6 +274,12 @@ final class AppState: ObservableObject {
             }
 
             guard !Task.isCancelled else { return }
+
+            // Build / cleanBuild are synchronous — no Phase 2 needed.
+            if action == .build || action == .cleanBuild {
+                await refresh()
+                return
+            }
 
             // Sync snapshot so Phase 2 sees the post-Phase-1 state immediately
             // rather than waiting up to 2 seconds for the next poll.
@@ -292,15 +301,30 @@ final class AppState: ObservableObject {
             waitLoop: while Date() < deadline && !Task.isCancelled {
                 let state = snapshotState(project: project, service: service.name)
                 switch action {
-                case .start, .restart, .hotRestart:
+                case .start, .restart, .hotRestart, .startWithBuild:
                     if state == .up || state == .down { break waitLoop }
                 case .stop:
                     if state == .down { break waitLoop }
+                case .build, .cleanBuild:
+                    break waitLoop // build/cleanBuild have no Phase 2 (handled above)
                 }
                 try? await Task.sleep(for: .milliseconds(500))
             }
 
             await refresh()
+
+            // When start/restart/hotRestart lands on .down the build likely
+            // failed.  Surface the tail of the log so the user sees the
+            // compilation error instead of a silent transition to DOWN.
+            if action != .stop {
+                let finalState = snapshotState(project: project, service: service.name)
+                if finalState == .down, let tail = try? manager.logs(of: service, lines: 20) {
+                    let trimmed = tail.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        lastError = "\(service.name) failed to start:\n\(trimmed)"
+                    }
+                }
+            }
         }
         pendingTasks[key] = task
     }
@@ -335,9 +359,57 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Builds the entire project (all modules) in one Maven reactor build.
+    /// Uses a single `buildAll` key so the busy dot shows on every service.
+    func buildAll(project: String) {
+        let allKey = ServiceKey(project: project, service: "*")
+        pendingTasks[allKey]?.cancel()
+        busyAction[allKey] = .build
+        objectWillChange.send()
+        let task = Task {
+            defer {
+                if busyAction[allKey] == .build { busyAction.removeValue(forKey: allKey) }
+                pendingTasks.removeValue(forKey: allKey)
+            }
+            guard let manager = await workspace.project(named: project) else { return }
+            guard !Task.isCancelled else { return }
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Result { try manager.buildAll() }
+            }.value
+            if case .failure(let error) = outcome {
+                lastError = "\(project): \(Self.describe(error))"
+            }
+            await refresh()
+        }
+        pendingTasks[allKey] = task
+    }
+
+    func cleanBuildAll(project: String) {
+        let allKey = ServiceKey(project: project, service: "*")
+        pendingTasks[allKey]?.cancel()
+        busyAction[allKey] = .cleanBuild
+        objectWillChange.send()
+        let task = Task {
+            defer {
+                if busyAction[allKey] == .cleanBuild { busyAction.removeValue(forKey: allKey) }
+                pendingTasks.removeValue(forKey: allKey)
+            }
+            guard let manager = await workspace.project(named: project) else { return }
+            guard !Task.isCancelled else { return }
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Result { try manager.cleanBuildAll() }
+            }.value
+            if case .failure(let error) = outcome {
+                lastError = "\(project): \(Self.describe(error))"
+            }
+            await refresh()
+        }
+        pendingTasks[allKey] = task
+    }
+
     private func effectiveState(_ action: ServiceAction) -> ServiceState {
         switch action {
-        case .start, .restart, .hotRestart: return .starting
+        case .start, .restart, .hotRestart, .build, .cleanBuild, .startWithBuild: return .starting
         case .stop: return .down
         }
     }

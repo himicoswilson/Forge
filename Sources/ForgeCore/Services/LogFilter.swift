@@ -10,17 +10,17 @@ public enum LogFilter {
         case invalidDuration(String)
     }
 
-    /// Parses "30s" / "5m" / "2h" into seconds; a bare number means seconds.
+    /// Parses "10m" / "2h" into seconds; suffix is required (m = minutes, h = hours).
     public static func parseDuration(_ text: String) throws -> TimeInterval {
         let trimmed = text.trimmingCharacters(in: .whitespaces).lowercased()
-        guard let match = try? /(\d+)\s*([smh]?)/.wholeMatch(in: trimmed),
+        guard let match = try? /(\d+)\s*([mh])/.wholeMatch(in: trimmed),
               let value = TimeInterval(match.1) else {
             throw QueryError.invalidDuration(text)
         }
         switch match.2 {
         case "m": return value * 60
         case "h": return value * 3600
-        default: return value
+        default: throw QueryError.invalidDuration(text)
         }
     }
 

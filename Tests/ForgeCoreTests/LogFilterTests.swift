@@ -122,18 +122,23 @@ struct LogFilterTests {
 
     // MARK: - parseDuration
 
-    @Test("durations: 30s, 5m, 2h, bare seconds")
+    @Test("durations: 10m, 30m, 2h")
     func durations() throws {
-        #expect(try LogFilter.parseDuration("30s") == 30)
-        #expect(try LogFilter.parseDuration("5m") == 300)
+        #expect(try LogFilter.parseDuration("10m") == 600)
+        #expect(try LogFilter.parseDuration("30m") == 1800)
         #expect(try LogFilter.parseDuration("2h") == 7200)
-        #expect(try LogFilter.parseDuration("90") == 90)
     }
 
     @Test("invalid duration throws")
     func invalidDuration() {
         #expect(throws: LogFilter.QueryError.invalidDuration("yesterday")) {
             try LogFilter.parseDuration("yesterday")
+        }
+        #expect(throws: LogFilter.QueryError.invalidDuration("30s")) {
+            try LogFilter.parseDuration("30s")
+        }
+        #expect(throws: LogFilter.QueryError.invalidDuration("90")) {
+            try LogFilter.parseDuration("90")
         }
     }
 }

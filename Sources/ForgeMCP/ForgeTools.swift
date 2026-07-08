@@ -98,7 +98,7 @@ public struct ForgeTools: Sendable {
     public static let catalog: [Tool] = [
         Tool(
             name: "list_services",
-            description: "Status snapshot of every non-ignored service in all registered projects: up/starting/down, pid, port, memory, uptime, and startingFor (how long a starting service has been starting)",
+            description: "Status snapshot of every non-ignored service in all registered projects: up/starting/down, pid, port, memory, uptime, and startingFor. The startingFor field shows how long a 'starting' service has been starting (e.g. '01:23'); if over ~60s the service is likely stuck or failing — check its logs with get_logs.",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -112,7 +112,7 @@ public struct ForgeTools: Sendable {
         ),
         Tool(
             name: "get_service",
-            description: "Status of one service: up/down/starting, pid, port, memory, uptime",
+            description: "Status of one service: up/down/starting, pid, port, memory, uptime, startingFor. Use this to check a service's state before acting on it (e.g. before restart or hotrestart) — avoids operating on a service that is already up or still starting.",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -128,7 +128,7 @@ public struct ForgeTools: Sendable {
         ),
         Tool(
             name: "get_logs",
-            description: "Service log, tail or regex search, from the durable log file (~/.forge/logs/<session>.log — full history since start; only exists for services started by Forge). Always returns at most 200 lines (the most recent). Use pattern + context to jump straight to exception stacks instead of reading a plain tail.",
+            description: "Query a service's log file (~/.forge/logs/<session>.log — full history since start; only exists for services started by Forge). Returns at most 50 lines. IMPORTANT: always use 'pattern' to search for specific errors (e.g. pattern='Exception|ERROR' with context=3) — pattern searches the entire log file before the 50-line limit is applied, so you won't miss anything. A bare tail (no pattern) only shows the last 50 lines and will likely miss earlier exceptions. Use 'since' only when you know the approximate time of an event (e.g. since='10m' for a service that just failed to start); for historical issues, prefer pattern over since.",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -139,15 +139,15 @@ public struct ForgeTools: Sendable {
                     "project": projectArg,
                     "pattern": [
                         "type": "string",
-                        "description": "Regex — return only matching lines (e.g. \"Exception|ERROR\") instead of a plain tail",
+                        "description": "Regex — search the entire log for matching lines (e.g. 'Exception|ERROR'). Much more reliable than a plain tail because it scans the full file before the 50-line limit. Use context to include surrounding lines.",
                     ],
                     "context": [
                         "type": "integer",
-                        "description": "With pattern: also include N lines around each match, like grep -C (default 0)",
+                        "description": "With pattern: include N lines before and after each match, like grep -C (default 0). Use context=3 to capture exception stack traces.",
                     ],
                     "since": [
                         "type": "string",
-                        "description": "Only entries from the last N seconds/minutes/hours — \"30s\", \"5m\", \"2h\" — judged by log line timestamps",
+                        "description": "Only entries from the last N minutes or hours — '10m', '30m', '2h' — judged by log line timestamps. Best for recent events; use pattern instead for historical issues.",
                     ],
                 ],
                 "required": ["service"],
@@ -156,9 +156,10 @@ public struct ForgeTools: Sendable {
         ),
         Tool(
             name: "start_service",
-            description: "Start one or more services in tmux sessions. Idempotent: services already up or starting are skipped (never an error), stale dead sessions are cleared first. By default blocks until every started/starting service reports UP.",
+            description: "Start one or more services in tmux sessions. Idempotent: services already up or starting are skipped (never an error), stale dead sessions are cleared first. By default starts without building (fast, ~1s); set build=true to run mvn install before starting (adds 10-30s). Use build=true after switching branches or when code has changed; use the default (build=false) for fast restarts when code is unchanged. By default blocks until every started/starting service reports UP.",
             inputSchema: multiServiceSchema(extra: [
                 "wait": waitArg("Wait until each service reports UP before returning (default: true). Set false to fire-and-forget."),
+                "build": ["type": "boolean", "description": "Run mvn install before starting (default: false). Set true after switching branches or when dependencies may be stale; leave false for fast launches when code is unchanged."],
                 "timeoutSeconds": timeoutArg,
             ])
         ),
@@ -170,18 +171,26 @@ public struct ForgeTools: Sendable {
         ),
         Tool(
             name: "restart_service",
-            description: "Full restart of one or more services (stop + start), in parallel. By default blocks until each service reports UP; on timeout the error includes the recent log tail.",
+            description: "Full restart of one or more services (stop → wait for port free → start), in parallel. By default starts without building (fast); set build=true to run mvn install before starting (adds 10-30s). Use build=true after switching branches or when code has changed; use the default (build=false) when code is unchanged. By default blocks until each service reports UP; on timeout the error includes the recent log tail.",
             inputSchema: multiServiceSchema(extra: [
                 "wait": waitArg("Wait until each restarted service reports UP before returning (default: true). Set false to return as soon as the restart is issued."),
+                "build": ["type": "boolean", "description": "Run mvn install before starting (default: false). Set true after switching branches or when dependencies may be stale; leave false for fast restarts when code is unchanged."],
                 "timeoutSeconds": timeoutArg,
             ])
         ),
         Tool(
             name: "hotrestart_service",
-            description: "Recompile one or more services' Maven modules so Spring DevTools hot-reloads them, then confirm each service reports UP again. All compiles run in parallel. Only works for services where supportsHotRestart is true (spring-boot-devtools detected in pom.xml); unsupported services fail immediately with a clear message.",
+            description: "Hot-restart one or more services by recompiling their Maven modules so Spring DevTools reloads them in-place — much faster than a full restart (2-5s vs 15-30s). Use this during active development when only Java source files changed. Only works for services where supportsHotRestart is true (spring-boot-devtools detected in pom.xml); unsupported services fail immediately. All compiles run in parallel.",
             inputSchema: multiServiceSchema(extra: [
                 "wait": waitArg("After compiling, wait until the service reports UP again (default: true). Set false to skip the confirmation."),
                 "timeoutSeconds": timeoutArg,
+            ])
+        ),
+        Tool(
+            name: "build_service",
+            description: "Build one or more services' Maven modules without starting them. Runs in parallel. By default does an incremental build (mvn package — compiles only changed files, typically seconds); set clean=true for a full rebuild (mvn clean package — rebuilds from scratch, typically 10-30s per module). Use incremental for normal development; use clean when builds fail unexpectedly or after major changes. NOTE: this only compiles — it does NOT start the service. To build and start in one step, use start_service with build=true instead.",
+            inputSchema: multiServiceSchema(extra: [
+                "clean": ["type": "boolean", "description": "Full rebuild with mvn clean package instead of incremental mvn package (default: false). Use when incremental builds fail or after major changes."],
             ])
         ),
     ]
@@ -253,7 +262,7 @@ public struct ForgeTools: Sendable {
                 let since = try args["since"]?.stringValue.map(LogFilter.parseDuration)
                 let output = try mgr.logs(
                     of: svc,
-                    lines: 200,
+                    lines: 50,
                     pattern: pattern,
                     context: args["context"]?.intValue ?? 0,
                     since: since
@@ -268,10 +277,14 @@ public struct ForgeTools: Sendable {
             case "start_service":
                 let pairs = try resolveServices(args, in: projects)
                 let wait = args["wait"]?.boolValue ?? true
+                let build = args["build"]?.boolValue ?? false
                 let timeout = args["timeoutSeconds"]?.intValue ?? 180
                 let (lines, hadError) = concurrently(pairs) { mgr, svc in
                     let label = "\(mgr.config.name)/\(svc.name)"
-                    switch try mgr.startIfNeeded(svc) {
+                    let outcome = try build
+                        ? mgr.startWithBuildIfNeeded(svc)
+                        : mgr.startIfNeeded(svc)
+                    switch outcome {
                     case .alreadyUp:
                         return "\(label): skipped — already up."
                     case .alreadyStarting:
@@ -302,13 +315,34 @@ public struct ForgeTools: Sendable {
             case "restart_service":
                 let pairs = try resolveServices(args, in: projects)
                 let wait = args["wait"]?.boolValue ?? true
+                let build = args["build"]?.boolValue ?? false
                 let timeout = args["timeoutSeconds"]?.intValue ?? 180
                 let (lines, hadError) = concurrently(pairs) { mgr, svc in
                     let label = "\(mgr.config.name)/\(svc.name)"
-                    try mgr.restart(svc)
+                    if build {
+                        try mgr.restartWithBuild(svc)
+                    } else {
+                        try mgr.restart(svc)
+                    }
                     guard wait else { return "\(label): restarted (not waiting — state 'starting' until UP)." }
                     try waitForUpAttachingLogs(mgr, svc, timeout: timeout)
                     return "\(label): restarted — UP on port \(svc.port)."
+                }
+                return .init(content: [textContent(lines.joined(separator: "\n"))], isError: hadError)
+
+            // MARK: build_service
+            case "build_service":
+                let pairs = try resolveServices(args, in: projects)
+                let clean = args["clean"]?.boolValue ?? false
+                let (lines, hadError) = concurrently(pairs) { mgr, svc in
+                    let label = "\(mgr.config.name)/\(svc.name)"
+                    if clean {
+                        try mgr.cleanBuild(svc)
+                        return "\(label): clean build completed."
+                    } else {
+                        try mgr.build(svc)
+                        return "\(label): incremental build completed."
+                    }
                 }
                 return .init(content: [textContent(lines.joined(separator: "\n"))], isError: hadError)
 
