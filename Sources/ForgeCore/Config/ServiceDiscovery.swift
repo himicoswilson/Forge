@@ -24,7 +24,7 @@ public enum ServiceDiscovery {
 
     public static func discover(projectRoot: URL) -> Discovery {
         var found: [(artifactId: String, path: String, port: Int, supportsHotRestart: Bool)] = []
-        collect(moduleDir: projectRoot, relativePath: "", into: &found)
+        collect(moduleDir: projectRoot, relativePath: "", into: &found, projectRoot: projectRoot)
         guard !found.isEmpty else { return .empty }
 
         let prefix = sharedPrefix(of: found.map(\.artifactId))
@@ -53,7 +53,8 @@ public enum ServiceDiscovery {
     private static func collect(
         moduleDir: URL,
         relativePath: String,
-        into found: inout [(artifactId: String, path: String, port: Int, supportsHotRestart: Bool)]
+        into found: inout [(artifactId: String, path: String, port: Int, supportsHotRestart: Bool)],
+        projectRoot: URL
     ) {
         let pomURL = moduleDir.appendingPathComponent("pom.xml")
         guard let data = try? Data(contentsOf: pomURL),
@@ -68,7 +69,8 @@ public enum ServiceDiscovery {
                 collect(
                     moduleDir: moduleDir.appendingPathComponent(child),
                     relativePath: relativePath.isEmpty ? child : "\(relativePath)/\(child)",
-                    into: &found
+                    into: &found,
+                    projectRoot: projectRoot
                 )
             }
             return
@@ -78,7 +80,7 @@ public enum ServiceDiscovery {
         let artifactId = (try? pom.nodes(forXPath: artifactIdXPath))?.first?.stringValue
             ?? moduleDir.lastPathComponent
         found.append((artifactId: artifactId, path: relativePath, port: port,
-                      supportsHotRestart: hasDevTools(inModule: moduleDir)))
+                      supportsHotRestart: hasDevTools(inModule: moduleDir, projectRoot: projectRoot)))
     }
 
     /// `prefix` is only meaningful when every artifactId starts with the
@@ -94,14 +96,29 @@ public enum ServiceDiscovery {
 
     // MARK: - spring-boot-devtools detection
 
-    /// True when the module's own pom.xml mentions spring-boot-devtools.
-    /// String search is intentional: it handles any namespace variant and
-    /// finds both direct dependency declarations and imported BOMs.
-    /// If the pom is unreadable, returns true (optimistic — don't block hot restart).
-    static func hasDevTools(inModule moduleDir: URL) -> Bool {
-        let pomURL = moduleDir.appendingPathComponent("pom.xml")
-        guard let text = try? String(contentsOf: pomURL, encoding: .utf8) else { return true }
-        return text.contains("spring-boot-devtools")
+    /// True when spring-boot-devtools appears in the module's own pom.xml OR
+    /// any ancestor pom up to (and including) `projectRoot`. This handles the
+    /// common pattern where devtools is declared once in the root
+    /// dependencyManagement/BOM rather than repeated in every leaf module.
+    /// String search handles any namespace variant and imported BOMs.
+    /// If any pom is unreadable the search continues; returns true only when
+    /// found, or false when the whole chain is readable and none match.
+    static func hasDevTools(inModule moduleDir: URL, projectRoot: URL) -> Bool {
+        var dir = moduleDir
+        let root = projectRoot.standardizedFileURL
+        while true {
+            let pom = dir.appendingPathComponent("pom.xml")
+            if let text = try? String(contentsOf: pom, encoding: .utf8),
+               text.contains("spring-boot-devtools") {
+                return true
+            }
+            let std = dir.standardizedFileURL
+            if std == root { break }
+            let parent = dir.deletingLastPathComponent()
+            if parent.standardizedFileURL == std { break }   // filesystem root
+            dir = parent
+        }
+        return false
     }
 
     // MARK: - server.port extraction

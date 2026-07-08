@@ -56,6 +56,8 @@ final class AppState: ObservableObject {
     private let workspace = Workspace()
     private var mcp: ForgeMCPServer?
     private var pollTask: Task<Void, Never>?
+    /// In-flight action task per service — cancelled when a new action supersedes it.
+    private var pendingTasks: [ServiceKey: Task<Void, Never>] = [:]
 
     static let pollInterval: Duration = .seconds(2)
 
@@ -229,27 +231,85 @@ final class AppState: ObservableObject {
 
     func perform(_ action: ServiceAction, project: String, service: ServiceConfig) {
         let key = ServiceKey(project: project, service: service.name)
-        guard busyAction[key] == nil else { return }
+        // Cancel any in-flight task for this service so the new action takes over.
+        pendingTasks[key]?.cancel()
         busyAction[key] = action
-        Task {
-            if let manager = await workspace.project(named: project) {
-                let result = await Task.detached(priority: .userInitiated) {
-                    Result {
-                        switch action {
-                        case .start: try manager.start(service)
-                        case .stop: try manager.stop(service)
-                        case .restart: try manager.restart(service)
-                        case .hotRestart: try manager.hotRestart(service)
-                        }
+        // Force an immediate menu refresh so the dot flips to starting/down
+        // before the shell operation begins — the default @Published coalescing
+        // can delay the redraw until the next run-loop tick, which is too late
+        // when Phase 1 starts right away.
+        objectWillChange.send()
+        let task = Task {
+            defer {
+                // Only clear if we're still the active action — a superseding
+                // action may have already replaced busyAction[key].
+                if busyAction[key] == action {
+                    busyAction.removeValue(forKey: key)
+                }
+                pendingTasks.removeValue(forKey: key)
+            }
+            guard let manager = await workspace.project(named: project) else { return }
+
+            guard !Task.isCancelled else { return }
+
+            // Phase 1 — execute the shell operation (fast: session/kill/compile).
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Result {
+                    switch action {
+                    case .start:      try manager.start(service)
+                    case .stop:       try manager.stop(service)
+                    case .restart:    try manager.restart(service)
+                    case .hotRestart: try manager.hotRestart(service)
                     }
-                }.value
-                if case .failure(let error) = result {
-                    lastError = "\(service.name): \(Self.describe(error))"
+                }
+            }.value
+
+            if case .failure(let error) = outcome {
+                lastError = "\(service.name): \(Self.describe(error))"
+                await refresh()
+                return
+            }
+
+            guard !Task.isCancelled else { return }
+
+            // Sync snapshot so Phase 2 sees the post-Phase-1 state immediately
+            // rather than waiting up to 2 seconds for the next poll.
+            await refresh()
+
+            // Phase 2 — watch `snapshots` (updated by the existing 2-second poll)
+            // rather than spawning a separate subprocess loop per service.
+            let timeout: TimeInterval = (action == .stop) ? 15 : 180
+            let deadline = Date().addingTimeInterval(timeout)
+
+            if action == .hotRestart {
+                let dipEnd = Date().addingTimeInterval(10)
+                while Date() < dipEnd && !Task.isCancelled {
+                    if snapshotState(project: project, service: service.name) != .up { break }
+                    try? await Task.sleep(for: .milliseconds(500))
                 }
             }
-            busyAction.removeValue(forKey: key)
+
+            waitLoop: while Date() < deadline && !Task.isCancelled {
+                let state = snapshotState(project: project, service: service.name)
+                switch action {
+                case .start, .restart, .hotRestart:
+                    if state == .up || state == .down { break waitLoop }
+                case .stop:
+                    if state == .down { break waitLoop }
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+
             await refresh()
         }
+        pendingTasks[key] = task
+    }
+
+    private func snapshotState(project: String, service: String) -> ServiceState? {
+        snapshots
+            .first { $0.name == project }?
+            .services.first { $0.service.name == service }?
+            .state
     }
 
     func startAll(project: String) {
@@ -262,9 +322,23 @@ final class AppState: ObservableObject {
 
     func stopAll(project: String) {
         for status in orderedServices(for: project)
-            where !isIgnored(project: project, service: status.service.name) && status.state != .down
+            where !isIgnored(project: project, service: status.service.name)
         {
+            let key = ServiceKey(project: project, service: status.service.name)
+            // Include services that are starting (busyAction = .start) even if
+            // the snapshot still shows them as .down — they need to be stopped too.
+            let effective = busyAction[key] != nil
+                ? effectiveState(busyAction[key]!)
+                : status.state
+            guard effective != .down else { continue }
             perform(.stop, project: project, service: status.service)
+        }
+    }
+
+    private func effectiveState(_ action: ServiceAction) -> ServiceState {
+        switch action {
+        case .start, .restart, .hotRestart: return .starting
+        case .stop: return .down
         }
     }
 

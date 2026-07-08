@@ -60,27 +60,55 @@ private enum ForgeIcon {
 // MARK: - State dot (NSImage, not Canvas — Canvas silently drops in .menu style)
 
 extension ServiceState {
-    var dotImage: NSImage {
+    /// Cached dot images — one static instance per state so SwiftUI's
+    /// diffing can detect the reference change when the state flips.
+    /// Previously a new NSImage was created on every access, which meant
+    /// the menu bar's NSMenu never saw a *stable* reference change and
+    /// often skipped redrawing the icon.
+    private static let upDot: NSImage = {
         let size = NSSize(width: 9, height: 9)
         let img = NSImage(size: size, flipped: false) { _ in
             let rect = NSRect(x: 0.5, y: 0.5, width: 8, height: 8)
-            switch self {
-            case .up:
-                NSColor.systemGreen.setFill()
-                NSBezierPath(ovalIn: rect).fill()
-            case .starting:
-                NSColor.systemYellow.setFill()
-                NSBezierPath(ovalIn: rect).fill()
-            case .down:
-                NSColor.tertiaryLabelColor.setStroke()
-                let path = NSBezierPath(ovalIn: rect)
-                path.lineWidth = 1.5
-                path.stroke()
-            }
+            NSColor.systemGreen.setFill()
+            NSBezierPath(ovalIn: rect).fill()
             return true
         }
         img.isTemplate = false
         return img
+    }()
+
+    private static let startingDot: NSImage = {
+        let size = NSSize(width: 9, height: 9)
+        let img = NSImage(size: size, flipped: false) { _ in
+            let rect = NSRect(x: 0.5, y: 0.5, width: 8, height: 8)
+            NSColor.systemYellow.setFill()
+            NSBezierPath(ovalIn: rect).fill()
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }()
+
+    private static let downDot: NSImage = {
+        let size = NSSize(width: 9, height: 9)
+        let img = NSImage(size: size, flipped: false) { _ in
+            let rect = NSRect(x: 0.5, y: 0.5, width: 8, height: 8)
+            NSColor.tertiaryLabelColor.setStroke()
+            let path = NSBezierPath(ovalIn: rect)
+            path.lineWidth = 1.5
+            path.stroke()
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }()
+
+    var dotImage: NSImage {
+        switch self {
+        case .up:       return Self.upDot
+        case .starting: return Self.startingDot
+        case .down:     return Self.downDot
+        }
     }
 }
 
@@ -167,6 +195,11 @@ private struct ServiceMenuView: View {
                 Image(nsImage: dotState.dotImage)
             }
         }
+        // Force NSMenu to rebuild the submenu item when the dot state
+        // changes.  Without this, .menuBarExtraStyle(.menu) caches the
+        // NSMenuItem image and ignores SwiftUI diffing updates — the dot
+        // stays stale even after objectWillChange.send().
+        .id(dotState)
     }
 
     /// While an action is in-flight the dot shows the expected transitional

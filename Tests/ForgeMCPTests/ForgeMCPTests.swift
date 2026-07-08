@@ -29,7 +29,8 @@ struct ForgeMCPTests {
             projectRoot: URL(fileURLWithPath: "/projects/cloud-a"),
             runner: runner,
             logsDirectory: logsRoot,
-            health: .simulating()
+            health: .simulating(),
+            pidAlive: ServiceManager.testPidAlive
         )
     }
 
@@ -46,7 +47,8 @@ struct ForgeMCPTests {
             projectRoot: URL(fileURLWithPath: "/projects/cloud-b"),
             runner: runner,
             logsDirectory: logsRoot,
-            health: .simulating()
+            health: .simulating(),
+            pidAlive: ServiceManager.testPidAlive
         )
     }
 
@@ -200,7 +202,8 @@ struct ForgeMCPTests {
             ),
             projectRoot: URL(fileURLWithPath: "/projects/cloud-a"),
             runner: runner,
-            logsDirectory: dir
+            logsDirectory: dir,
+            pidAlive: ServiceManager.testPidAlive
         ))
         let server = await ForgeMCPServer.makeServer(tools: ForgeTools(workspace: workspace))
         let (clientTransport, serverTransport) = await InMemoryTransport.createConnectedPair()
@@ -436,7 +439,8 @@ struct ForgeMCPTests {
             ),
             projectRoot: URL(fileURLWithPath: "/projects/cloud-a"),
             runner: runner,
-            logsDirectory: dir
+            logsDirectory: dir,
+            pidAlive: ServiceManager.testPidAlive
         ))
         let server = await ForgeMCPServer.makeServer(tools: ForgeTools(workspace: workspace))
         let (clientTransport, serverTransport) = await InMemoryTransport.createConnectedPair()

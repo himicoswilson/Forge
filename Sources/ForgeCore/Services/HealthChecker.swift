@@ -3,10 +3,16 @@ import Foundation
 import FoundationNetworking
 #endif
 
-/// Asks a service's Spring Boot Actuator whether it is actually ready, via an
-/// in-process HTTP GET of `http://127.0.0.1:<port>/actuator/health`. A bound
+/// Asks a service's health endpoint whether it is actually ready, via an
+/// in-process HTTP GET of `http://127.0.0.1:<port>/<path>`. A bound
 /// port alone is not readiness for Spring Cloud — it answers long before Nacos
 /// registration and bean initialization finish.
+///
+/// The default path is `/actuator/health` (Spring Boot Actuator). Services
+/// that don't use Actuator can declare a custom `healthPath` in config.json;
+/// a 404 on the default path now reports `.starting` rather than `.up`,
+/// because a missing actuator typically means the app hasn't finished
+/// initialising yet.
 ///
 /// This used to shell out to `curl`, which cost one subprocess spawn per
 /// port-bound service on every status poll; the transport is injectable so
@@ -16,11 +22,19 @@ public struct HealthChecker: Sendable {
         /// HTTP 200 with `"status":"UP"` — fully ready.
         case ready
         /// HTTP 404 — the service exposes no actuator; a bound port is the
-        /// best signal available, so callers should treat this as ready.
+        /// best signal available, so callers should treat this as starting
+        /// (the endpoint may not be registered yet).
         case noActuator
         /// Timeout, connection reset, 503/DOWN — still initializing.
         case notReady
     }
+
+    /// Default health check path for Spring Boot Actuator services.
+    public static let defaultHealthPath = "/actuator/health"
+
+    /// Default timeout in seconds — generous enough for GC pauses and
+    /// slow startup, but short enough to avoid stalling the poll cycle.
+    public static let defaultTimeout: TimeInterval = 3
 
     /// Blocking HTTP GET: status code and body, or nil on any transport
     /// failure (timeout, connection refused/reset).
@@ -32,9 +46,9 @@ public struct HealthChecker: Sendable {
         self.get = get
     }
 
-    public func check(port: Int) -> Result {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/actuator/health"),
-              let response = get(url, 1) else {
+    public func check(port: Int, path: String = defaultHealthPath, timeout: TimeInterval = defaultTimeout) -> Result {
+        guard let url = URL(string: "http://127.0.0.1:\(port)\(path)"),
+              let response = get(url, timeout) else {
             return .notReady
         }
         return Self.interpret(statusCode: response.statusCode, body: response.body)
@@ -60,8 +74,8 @@ public struct HealthChecker: Sendable {
     /// `curl` reported before.
     private static let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 1
-        configuration.timeoutIntervalForResource = 1
+        configuration.timeoutIntervalForRequest = defaultTimeout
+        configuration.timeoutIntervalForResource = defaultTimeout
         return URLSession(configuration: configuration, delegate: NoRedirects(), delegateQueue: nil)
     }()
 

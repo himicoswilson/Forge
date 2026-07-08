@@ -35,7 +35,8 @@ struct ServiceManagerTests {
             projectRoot: root,
             runner: runner,
             logsDirectory: logsRoot,
-            health: health
+            health: health,
+            pidAlive: ServiceManager.testPidAlive
         )
     }
 
@@ -208,7 +209,8 @@ struct ServiceManagerTests {
             projectRoot: URL(fileURLWithPath: "/projB"),
             runner: runner,
             logsDirectory: logsRoot,
-            health: .simulating()
+            health: .simulating(),
+            pidAlive: ServiceManager.testPidAlive
         )
 
         let all = ServiceManager.statusAll(of: [projectA, projectB])
@@ -375,7 +377,7 @@ struct ServiceManagerTests {
     func hotRestartWithJDK() throws {
         let jdkConfig = ForgeConfig(name: "normal-cloud", prefix: "wr", jdk: "17", services: config.services)
         let runner = MockCommandRunner.simulating(javaHome: "/jdk17")
-        let mgr = ServiceManager(config: jdkConfig, projectRoot: root, runner: runner)
+        let mgr = ServiceManager(config: jdkConfig, projectRoot: root, runner: runner, pidAlive: ServiceManager.testPidAlive)
 
         try mgr.hotRestart(jdkConfig.service(named: "train")!)
 
@@ -497,7 +499,7 @@ struct ServiceManagerTests {
         let dir = try logsDir(content: "from the file\n")
         defer { try? FileManager.default.removeItem(at: dir) }
         let runner = world()
-        let mgr = ServiceManager(config: config, projectRoot: root, runner: runner, logsDirectory: dir)
+        let mgr = ServiceManager(config: config, projectRoot: root, runner: runner, logsDirectory: dir, pidAlive: ServiceManager.testPidAlive)
         #expect(try mgr.logs(of: config.service(named: "auth")!) == "from the file")
         #expect(runner.calls.isEmpty)
     }
@@ -512,7 +514,7 @@ struct ServiceManagerTests {
             more noise
             """)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let mgr = ServiceManager(config: config, projectRoot: root, runner: world(), logsDirectory: dir)
+        let mgr = ServiceManager(config: config, projectRoot: root, runner: world(), logsDirectory: dir, pidAlive: ServiceManager.testPidAlive)
 
         let output = try mgr.logs(of: config.service(named: "auth")!, pattern: "ERROR|Exception", context: 1)
 
@@ -532,7 +534,7 @@ struct ServiceManagerTests {
                 ? CommandResult(exitCode: 1, stderr: "no such option")
                 : CommandResult(exitCode: 0)
         }
-        let mgr = ServiceManager(config: config, projectRoot: root, runner: runner, logsDirectory: dir)
+        let mgr = ServiceManager(config: config, projectRoot: root, runner: runner, logsDirectory: dir, pidAlive: ServiceManager.testPidAlive)
 
         try mgr.start(config.service(named: "train")!)
 

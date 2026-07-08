@@ -101,6 +101,9 @@ extension MockCommandRunner {
                 if let idx = call.arguments.firstIndex(of: "-s"), idx + 1 < call.arguments.count {
                     state.addSession(call.arguments[idx + 1])
                 }
+                // Model the service starting and binding its port again: restore
+                // whatever ports were transiently released by a prior kill signal.
+                state.restoreSeededPorts()
                 return CommandResult(exitCode: 0)
 
             case "tmux" where call.arguments.first == "kill-session":
@@ -135,6 +138,14 @@ extension MockCommandRunner {
                 }
                 return CommandResult(exitCode: 0, stdout: state.isDead(call.arguments[2]) ? "1\n" : "0\n")
 
+            case "kill":
+                // kill -15 <pid> or kill -9 <pid> — model the process dying and
+                // releasing its port, matching what SIGTERM/SIGKILL actually does.
+                if let pidStr = call.arguments.last, let pid = Int32(pidStr) {
+                    state.releasePort(forPid: pid)
+                }
+                return CommandResult(exitCode: 0)
+
             case "/usr/libexec/java_home":
                 guard let javaHome else { return CommandResult(exitCode: 1, stderr: "Unable to find any JVMs") }
                 return CommandResult(exitCode: 0, stdout: javaHome + "\n")
@@ -156,6 +167,9 @@ private final class SimulationState: @unchecked Sendable {
     private var dead: Set<String>
     private var createdAt: [String: Date]
     private var ports: [Int: Int32]
+    /// Original port bindings — restored when a new session starts (models
+    /// the service re-binding its port after a kill+restart cycle).
+    private let seededPorts: [Int: Int32]
 
     init(sessions: Set<String>, dead: Set<String>, ports: [Int: Int32]) {
         self.sessions = sessions
@@ -164,6 +178,7 @@ private final class SimulationState: @unchecked Sendable {
         // for startingFor assertions.
         self.createdAt = Dictionary(uniqueKeysWithValues: sessions.map { ($0, Date().addingTimeInterval(-42)) })
         self.ports = ports
+        self.seededPorts = ports
     }
 
     func hasSession(_ name: String) -> Bool {
@@ -192,5 +207,15 @@ private final class SimulationState: @unchecked Sendable {
     }
     func pid(onPort port: Int) -> Int32? {
         lock.lock(); defer { lock.unlock() }; return ports[port]
+    }
+
+    func releasePort(forPid pid: Int32) {
+        lock.lock(); defer { lock.unlock() }
+        ports = ports.filter { $0.value != pid }
+    }
+
+    func restoreSeededPorts() {
+        lock.lock(); defer { lock.unlock() }
+        ports.merge(seededPorts) { _, seeded in seeded }
     }
 }

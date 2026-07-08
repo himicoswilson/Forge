@@ -13,7 +13,8 @@ struct WorkspaceTests {
                 services: services.sorted { $0.key < $1.key }.map { ServiceConfig(name: $0.key, port: $0.value) }
             ),
             projectRoot: URL(fileURLWithPath: "/projects/\(project)"),
-            runner: MockCommandRunner.simulating()
+            runner: MockCommandRunner.simulating(),
+            pidAlive: ServiceManager.testPidAlive
         )
     }
 

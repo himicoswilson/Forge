@@ -6,7 +6,7 @@ import Testing
 @Suite("HealthChecker")
 struct HealthCheckerTests {
 
-    @Test("queries actuator health over localhost with a 1s budget")
+    @Test("queries actuator health over localhost with a 3s budget")
     func argv() {
         nonisolated(unsafe) var seen: (url: URL, timeout: TimeInterval)?
         let checker = HealthChecker { url, timeout in
@@ -15,7 +15,7 @@ struct HealthCheckerTests {
         }
         #expect(checker.check(port: 9201) == .ready)
         #expect(seen?.url.absoluteString == "http://127.0.0.1:9201/actuator/health")
-        #expect(seen?.timeout == 1)
+        #expect(seen?.timeout == HealthChecker.defaultTimeout)
     }
 
     @Test("200 with status UP → ready, tolerating JSON whitespace")

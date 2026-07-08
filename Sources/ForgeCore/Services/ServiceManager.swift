@@ -19,6 +19,9 @@ public struct ServiceManager: Sendable {
     let tmux: TmuxController
     let health: HealthChecker
     let runner: any CommandRunning
+    /// Injectable PID liveness check. Defaults to `kill(pid, 0)`.
+    /// Tests substitute a closure that always returns true so mock PIDs work.
+    let pidAlive: @Sendable (Int32) -> Bool
 
     public static var defaultLogsDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".forge/logs")
@@ -29,7 +32,8 @@ public struct ServiceManager: Sendable {
         projectRoot: URL,
         runner: any CommandRunning = ProcessCommandRunner(),
         logsDirectory: URL? = nil,
-        health: HealthChecker = HealthChecker()
+        health: HealthChecker = HealthChecker(),
+        pidAlive: @Sendable @escaping (Int32) -> Bool = ServiceManager.defaultPidAlive
     ) {
         self.config = config
         self.projectRoot = projectRoot
@@ -38,6 +42,7 @@ public struct ServiceManager: Sendable {
         self.ports = PortChecker(runner: runner)
         self.tmux = TmuxController(runner: runner)
         self.health = health
+        self.pidAlive = pidAlive
     }
 
     // MARK: - Status
@@ -51,6 +56,14 @@ public struct ServiceManager: Sendable {
     /// can never drift apart (they used to be two hand-kept copies).
     public func status(of service: ServiceConfig) -> ServiceStatus {
         status(of: service, in: captureSnapshot(forPorts: [service.port]))
+    }
+
+    /// Default PID liveness check using `kill(pid, 0)`.
+    /// Signal 0 performs no action, just checks for process existence.
+    /// EPERM counts as alive — we only care that something is there,
+    /// not that we can signal it.
+    public static let defaultPidAlive: @Sendable (Int32) -> Bool = { pid in
+        kill(pid, 0) == 0 || errno == EPERM
     }
 
     /// `ps` etime formatting shared by the single-service and snapshot
@@ -103,11 +116,20 @@ public struct ServiceManager: Sendable {
     func status(of service: ServiceConfig, in snapshot: SystemSnapshot) -> ServiceStatus {
         let session = config.sessionName(for: service)
         if let pid = snapshot.listeners[service.port]?.first {
+            // Verify the PID is still alive — a crashed process can leave
+            // behind a socket that lsof still reports, or the PID may have
+            // been recycled by an unrelated process.
+            guard pidAlive(pid) else {
+                return ServiceStatus(service: service, state: .down)
+            }
             let info = snapshot.stats[pid]
-            switch health.check(port: service.port) {
-            case .ready, .noActuator:
+            switch health.check(port: service.port, path: service.effectiveHealthPath) {
+            case .ready:
                 return ServiceStatus(service: service, state: .up, pid: pid, memoryKB: info?.memoryKB, uptime: info?.uptime)
-            case .notReady:
+            case .noActuator, .notReady:
+                // noActuator (404): port is listening but actuator isn't registered
+                // yet — the service is still initialising.  notReady: health
+                // check failed outright.  Both mean the service is not fully up.
                 return ServiceStatus(
                     service: service, state: .starting, pid: pid,
                     memoryKB: info?.memoryKB, uptime: info?.uptime,
@@ -249,7 +271,27 @@ public struct ServiceManager: Sendable {
 
     public func restart(_ service: ServiceConfig) throws {
         try stop(service)
+        waitForDown(service)
         try start(service)
+    }
+
+    /// Blocks until nothing is listening on the service's port, then returns.
+    /// If the port is still held after `timeoutSeconds`, SIGKILLs the remaining
+    /// PID(s) so the caller can proceed regardless.
+    public func waitForDown(
+        _ service: ServiceConfig,
+        timeoutSeconds: Int = 30,
+        pollInterval: TimeInterval = 0.5
+    ) {
+        let deadline = Date().addingTimeInterval(Double(timeoutSeconds))
+        while Date() < deadline {
+            let bound = ports.listeningPids(onPorts: [service.port])
+            guard let pids = bound[service.port], !pids.isEmpty else { return }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+        for pid in ports.listeningPids(onPorts: [service.port])[service.port] ?? [] {
+            _ = try? runner.run("kill", ["-9", "\(pid)"])
+        }
     }
 
     /// What an idempotent start did (or skipped) for one service.
@@ -270,6 +312,25 @@ public struct ServiceManager: Sendable {
             try start(service)
             return .started
         }
+    }
+
+    /// Blocks until the service's port goes quiet (service left UP state) and
+    /// then comes back UP. Used after a hot-restart compile: DevTools detects
+    /// the new classes and triggers a context reload, causing a brief dip.
+    /// If the service never dips within `dipTimeoutSeconds`, proceeds straight
+    /// to `waitForUp` (DevTools may have finished before we started polling).
+    public func waitForReload(
+        _ service: ServiceConfig,
+        dipTimeoutSeconds: Int = 10,
+        upTimeoutSeconds: Int = 60,
+        pollInterval: TimeInterval = 0.5
+    ) throws {
+        let dipDeadline = Date().addingTimeInterval(Double(dipTimeoutSeconds))
+        while Date() < dipDeadline {
+            if status(of: service).state != .up { break }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+        try waitForUp(service, timeoutSeconds: upTimeoutSeconds, pollInterval: pollInterval)
     }
 
     /// Recompiles the service's Maven module so Spring DevTools reloads it:

@@ -9,18 +9,27 @@ public struct ServiceConfig: Sendable, Codable, Equatable, Hashable, Identifiabl
     /// True when the service's pom.xml declares spring-boot-devtools (detected at discovery
     /// time). Hot Restart is unavailable without it. Can be forced true in .forge/config.json.
     public let supportsHotRestart: Bool
+    /// Custom health-check path (e.g. `/health/live` for non-Actuator services).
+    /// Defaults to `/actuator/health` when nil.
+    public let healthPath: String?
 
     public var id: String { name }
 
-    public init(name: String, port: Int, module: String? = nil, supportsHotRestart: Bool = false) {
+    /// Resolved health-check path — falls back to the HealthChecker default.
+    public var effectiveHealthPath: String {
+        healthPath ?? HealthChecker.defaultHealthPath
+    }
+
+    public init(name: String, port: Int, module: String? = nil, supportsHotRestart: Bool = false, healthPath: String? = nil) {
         self.name = name
         self.port = port
         self.module = module
         self.supportsHotRestart = supportsHotRestart
+        self.healthPath = healthPath
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, port, module, supportsHotRestart
+        case name, port, module, supportsHotRestart, healthPath
     }
 
     public init(from decoder: Decoder) throws {
@@ -29,6 +38,7 @@ public struct ServiceConfig: Sendable, Codable, Equatable, Hashable, Identifiabl
         port = try c.decode(Int.self, forKey: .port)
         module = try c.decodeIfPresent(String.self, forKey: .module)
         supportsHotRestart = try c.decodeIfPresent(Bool.self, forKey: .supportsHotRestart) ?? false
+        healthPath = try c.decodeIfPresent(String.self, forKey: .healthPath)
     }
 }
 

@@ -12,3 +12,9 @@ extension HealthChecker {
         })
     }
 }
+
+extension ServiceManager {
+    /// PID liveness stub for tests: always returns true so that mock PIDs
+    /// (which don't correspond to real processes) pass the alive check.
+    public static let testPidAlive: @Sendable (Int32) -> Bool = { _ in true }
+}
